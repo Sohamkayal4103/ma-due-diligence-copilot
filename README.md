@@ -1,4 +1,4 @@
-# Full-Spectrum M&A Due-Diligence Copilot
+# Full-Spectrum Mergers and Acquisitions Due-Diligence Copilot
 
 An AI-native __Mergers and Acquisitions__ diligence operating system built with `mcp-use`, designed for enterprise deal teams, legal counsel, finance, and integration leadership.
 
