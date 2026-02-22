@@ -1348,10 +1348,16 @@ export default function LandingHomeWidget() {
       const hasLocalFileUpload = preparedDocuments.some((doc) =>
         Boolean(doc.file_upload)
       );
+      const resolvedMessage =
+        message === "Unknown intake submission error." && hasLocalFileUpload
+          ? "Unknown intake submission error (empty host response). This usually means the tool call payload was too large for connector transport, or Supabase storage upload failed (bucket/key/project mismatch)."
+          : message;
       const uploadHint = hasLocalFileUpload
         ? " Local file uploads require a valid Supabase Storage bucket (default `ma-diligence-docs`) and matching service role key."
         : "";
-      setSubmitMessage(`Could not submit intake: ${message}${uploadHint}`);
+      setSubmitMessage(
+        `Could not submit intake: ${resolvedMessage}${uploadHint}`
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -1743,6 +1749,7 @@ function extractErrorMessage(error: unknown, fallback: string): string {
   const obj = toObject(error);
   const direct =
     asString(obj.message) ??
+    asString(obj.name) ??
     asString(obj.error) ??
     asString(obj.detail) ??
     asString(obj.title);
