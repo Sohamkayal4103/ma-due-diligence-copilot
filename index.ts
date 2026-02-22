@@ -9,7 +9,12 @@ import {
   DueDiligenceOrchestrator,
   REVIEWER_ACTOR,
 } from "./src/orchestrator.js";
-import type { Finding, ScenarioDefinition, ScenarioResult } from "./src/types.js";
+import type {
+  Finding,
+  RiskGraph,
+  ScenarioDefinition,
+  ScenarioResult,
+} from "./src/types.js";
 
 const server = new MCPServer({
   name: "ma-due-diligence-orchestrator",
@@ -22,6 +27,27 @@ const LANDING_WIDGET_PATH = "/mcp-use/widgets/landing-home/index.html";
 
 const orchestrator = new DueDiligenceOrchestrator();
 const demoWorkspace = orchestrator.seedDemoWorkspace();
+
+type AiFindingStatus = "requires_approval" | "approved" | "rejected";
+
+interface StoredAiFinding {
+  finding_id: string;
+  workspace_id: string;
+  document_id: string;
+  document_name: string;
+  title: string;
+  summary: string;
+  management_points: string[];
+  tower: z.infer<typeof diligenceTowerSchema>;
+  severity: z.infer<typeof riskSeveritySchema>;
+  probability: number;
+  confidence: number;
+  impact_value: number;
+  status: AiFindingStatus;
+  created_at: string;
+}
+
+const aiFindingsByWorkspace = new Map<string, Map<string, StoredAiFinding>>();
 
 const actorSchema = z.object({
   user_id: z.string(),
@@ -396,6 +422,133 @@ server.tool(
 
 server.tool(
   {
+    name: "generate_visual_risk_graph",
+    description:
+      "Build a visual-ready risk graph payload (bars + status/severity breakdown + optional scenario overlay) for widgets.",
+    schema: z.object({
+      workspace_id: z.string(),
+      finding_id: z.string().optional(),
+      scenario_parameters: z
+        .object({
+          downside_multiplier: z.number(),
+          synergy_multiplier: z.number(),
+          integration_cost: z.number(),
+        })
+        .optional(),
+      actor: actorSchema.optional(),
+    }),
+    annotations: { readOnlyHint: true },
+  },
+  async ({ workspace_id, finding_id, scenario_parameters, actor }) => {
+    const resolvedActor = actor ?? DEMO_ACTOR;
+    const riskGraph = orchestrator.recomputeRiskGraph({
+      workspace_id,
+      actor: resolvedActor,
+    });
+    const platformFindings = orchestrator.listFindings({
+      workspace_id,
+      filters: {},
+      actor: resolvedActor,
+    });
+    const aiFindings = Array.from(getWorkspaceAiFindingMap(workspace_id).values());
+
+    const statusSource: string[] =
+      aiFindings.length > 0
+        ? aiFindings.map((finding) => finding.status)
+        : platformFindings.map((finding) => finding.status);
+    const severitySource: string[] =
+      aiFindings.length > 0
+        ? aiFindings.map((finding) => finding.severity)
+        : platformFindings.map((finding) => finding.severity);
+
+    const statusBreakdown = buildGraphBreakdown(statusSource, {
+      open: "#4f46e5",
+      requires_approval: "#d97706",
+      approved: "#0f766e",
+      rejected: "#b91c1c",
+      resolved: "#15803d",
+    });
+    const severityBreakdown = buildGraphBreakdown(severitySource, {
+      low: "#16a34a",
+      medium: "#ca8a04",
+      high: "#ea580c",
+      critical: "#dc2626",
+    });
+
+    const towerBars = riskGraph.tower_summaries
+      .slice()
+      .sort((a, b) => b.weighted_risk - a.weighted_risk)
+      .map((summary, index) => ({
+        key: summary.tower,
+        label: summary.tower.replace(/_/g, " "),
+        value: Math.round(summary.weighted_risk),
+        color: GRAPH_BAR_PALETTE[index % GRAPH_BAR_PALETTE.length]!,
+      }));
+
+    const scenarioOverlay =
+      scenario_parameters &&
+      orchestrator.runScenarios({
+        workspace_id,
+        scenario_set: [
+          {
+            name: "widget_overlay",
+            assumptions: {
+              downside_multiplier: scenario_parameters.downside_multiplier,
+              synergy_multiplier: scenario_parameters.synergy_multiplier,
+              integration_cost: scenario_parameters.integration_cost,
+            },
+          },
+        ],
+        actor: resolvedActor,
+      })[0];
+
+    const yMax = Math.max(
+      1,
+      ...towerBars.map((bar) => bar.value),
+      Math.round(Math.abs(scenarioOverlay?.risk_delta ?? 0))
+    );
+    const focusFinding =
+      finding_id && aiFindings.length > 0
+        ? aiFindings.find((finding) => finding.finding_id === finding_id)
+        : null;
+
+    return object({
+      workspace_id,
+      graph: {
+        title: "Risk Landscape by Diligence Tower",
+        subtitle:
+          "Higher bars indicate higher weighted risk concentration in that tower.",
+        generated_at: new Date().toISOString(),
+        total_weighted_risk: riskGraph.total_weighted_risk,
+        open_findings: riskGraph.open_findings,
+        requires_approval: riskGraph.requires_approval,
+        y_max: yMax,
+        bars: towerBars,
+        status_breakdown: statusBreakdown,
+        severity_breakdown: severityBreakdown,
+        scenario_overlay: scenarioOverlay
+          ? {
+              label: "Current scenario overlay",
+              risk_delta: scenarioOverlay.risk_delta,
+              valuation_delta: scenarioOverlay.valuation_delta,
+              integration_delta: scenarioOverlay.integration_delta,
+            }
+          : null,
+        focus_finding: focusFinding
+          ? {
+              finding_id: focusFinding.finding_id,
+              title: focusFinding.title,
+              status: focusFinding.status,
+              tower: focusFinding.tower,
+            }
+          : null,
+      },
+    });
+  }
+);
+
+server.tool(
+  {
     name: "run_scenarios",
     description:
       "Run downside/base/upside or custom scenario assumptions and return valuation/integration/risk deltas.",
@@ -647,6 +800,7 @@ server.tool(
     }
 
     const findings: OpenAiWidgetFinding[] = [];
+    const storedFindings: StoredAiFinding[] = [];
     const analyzedDocuments: OpenAiWidgetDocument[] = [];
     for (const doc of documents) {
       const source = await resolveDocumentContentForOpenAi(doc);
@@ -670,20 +824,45 @@ server.tool(
       });
 
       for (const item of aiResult.findings) {
+        const findingId = randomUUID();
+        const managementPoints = item.management_points
+          .map((point) => point.trim())
+          .filter((point) => point.length > 0)
+          .slice(0, 5);
         findings.push({
-          finding_id: randomUUID(),
+          finding_id: findingId,
           document_id: doc.document_id,
           document_name: doc.document_name,
           title: item.title,
           summary: item.summary,
+          management_points: managementPoints,
           tower: item.tower,
           severity: item.severity,
           probability: clamp01(item.probability),
           confidence: clamp01(item.confidence),
           impact_value: Math.max(0, Math.round(item.impact_value)),
+          status: "requires_approval",
+        });
+        storedFindings.push({
+          finding_id: findingId,
+          workspace_id,
+          document_id: doc.document_id,
+          document_name: doc.document_name,
+          title: item.title,
+          summary: item.summary,
+          management_points: managementPoints,
+          tower: item.tower,
+          severity: item.severity,
+          probability: clamp01(item.probability),
+          confidence: clamp01(item.confidence),
+          impact_value: Math.max(0, Math.round(item.impact_value)),
+          status: "requires_approval",
+          created_at: new Date().toISOString(),
         });
       }
     }
+
+    upsertWorkspaceAiFindings(workspace_id, storedFindings);
 
     const payload = {
       workspace_id,
@@ -701,6 +880,235 @@ server.tool(
     }
 
     return object(payload);
+  }
+);
+
+server.tool(
+  {
+    name: "set_ai_finding_status",
+    description:
+      "Approve or reject an OpenAI-generated finding for a workspace.",
+    schema: z.object({
+      workspace_id: z.string(),
+      finding_id: z.string(),
+      decision: z.enum(["approved", "rejected"]),
+      reason: z.string().optional(),
+      actor: actorSchema.optional(),
+    }),
+    annotations: { readOnlyHint: false },
+  },
+  async ({ workspace_id, finding_id, decision, reason, actor }) => {
+    const resolvedActor = actor ?? REVIEWER_ACTOR;
+    orchestrator.listFindings({
+      workspace_id,
+      filters: {},
+      actor: resolvedActor,
+    });
+
+    if (
+      resolvedActor.role !== "reviewer" &&
+      resolvedActor.role !== "admin" &&
+      !resolvedActor.scopes.includes("*")
+    ) {
+      throw new Error(
+        "Only reviewer/admin actors can approve or reject AI findings."
+      );
+    }
+
+    const finding = requireStoredAiFinding(workspace_id, finding_id);
+    finding.status = decision;
+
+    return object({
+      workspace_id,
+      finding,
+      reason: reason ?? null,
+      updated_at: new Date().toISOString(),
+    });
+  }
+);
+
+server.tool(
+  {
+    name: "run_ai_finding_plaintext_scenario",
+    description:
+      "Compare lawyer plain-English input against the source document via OpenAI, derive scenario parameters, and run scenario outputs in plain English.",
+    schema: z.object({
+      workspace_id: z.string(),
+      finding_id: z.string(),
+      plain_english: z.string().min(12),
+      model: z.string().default("gpt-4.1"),
+      actor: actorSchema.optional(),
+    }),
+    annotations: { readOnlyHint: false },
+  },
+  async ({ workspace_id, finding_id, plain_english, model, actor }) => {
+    const resolvedActor = actor ?? DEMO_ACTOR;
+    orchestrator.listFindings({
+      workspace_id,
+      filters: {},
+      actor: resolvedActor,
+    });
+
+    const openaiApiKey = process.env.OPENAI_API_KEY;
+    if (!openaiApiKey || openaiApiKey.trim().length === 0) {
+      throw new Error(
+        "OPENAI_API_KEY is not configured. Add it to .env/.env.local and restart."
+      );
+    }
+
+    const finding = requireStoredAiFinding(workspace_id, finding_id);
+    const document = await loadWorkspaceDocumentByIdFromSupabase(
+      workspace_id,
+      finding.document_id
+    );
+    const source = await resolveDocumentContentForOpenAi(document);
+
+    const aiComparison = await comparePlainEnglishWithDocumentUsingOpenAi({
+      workspace_id,
+      finding,
+      source_document: document,
+      source,
+      plain_english,
+      model,
+      api_key: openaiApiKey,
+    });
+
+    const calibrated = normalizeRecalibratedScenarioAssumptions(
+      aiComparison.recalibrated_parameters
+    );
+    const scenarioResult = orchestrator.runScenarios({
+      workspace_id,
+      scenario_set: [
+        {
+          name: `ai_finding_${finding.finding_id.slice(0, 8)}_plaintext`,
+          assumptions: scenarioAssumptionsToRecord(calibrated),
+        },
+      ],
+      actor: resolvedActor,
+    })[0];
+
+    const managementPlaintext = [
+      `Comparison result: ${aiComparison.comparison_result}.`,
+      aiComparison.legal_plaintext_assessment,
+      ...aiComparison.executive_points.map((point) => `- ${point}`),
+      `Recalibrated parameters: downside_multiplier=${calibrated.downside_multiplier}, synergy_multiplier=${calibrated.synergy_multiplier}, integration_cost=${calibrated.integration_cost}.`,
+      `Scenario output: valuation_delta=${scenarioResult.valuation_delta.toLocaleString()}, integration_delta=${scenarioResult.integration_delta.toLocaleString()}, risk_delta=${scenarioResult.risk_delta.toLocaleString()}.`,
+      aiComparison.management_explanation,
+    ].join(" ");
+
+    return object({
+      workspace_id,
+      finding,
+      document: {
+        document_id: document.document_id,
+        document_name: document.document_name,
+      },
+      plain_english_input: plain_english,
+      comparison: aiComparison,
+      recalibrated_parameters: scenarioAssumptionsToRecord(calibrated),
+      scenario_result: scenarioResult,
+      management_plaintext: managementPlaintext,
+    });
+  }
+);
+
+server.tool(
+  {
+    name: "generate_approved_findings_report",
+    description:
+      "Generate an executive report for approved AI findings only (excluding pending/rejected) and return a downloadable PDF payload.",
+    schema: z.object({
+      workspace_id: z.string(),
+      model: z.string().default("gpt-4.1"),
+      actor: actorSchema.optional(),
+    }),
+    annotations: { readOnlyHint: false },
+  },
+  async ({ workspace_id, model, actor }) => {
+    const resolvedActor = actor ?? REVIEWER_ACTOR;
+    orchestrator.listFindings({
+      workspace_id,
+      filters: {},
+      actor: resolvedActor,
+    });
+
+    const openaiApiKey = process.env.OPENAI_API_KEY;
+    if (!openaiApiKey || openaiApiKey.trim().length === 0) {
+      throw new Error(
+        "OPENAI_API_KEY is not configured. Add it to .env/.env.local and restart."
+      );
+    }
+
+    const aiFindings = Array.from(getWorkspaceAiFindingMap(workspace_id).values());
+    if (aiFindings.length === 0) {
+      throw new Error(
+        "No AI findings are available in-memory for this workspace. Run analyze_documents_with_openai first."
+      );
+    }
+
+    const approvedFindings = aiFindings.filter(
+      (finding) => finding.status === "approved"
+    );
+    const pendingCount = aiFindings.filter(
+      (finding) => finding.status === "requires_approval"
+    ).length;
+    const rejectedCount = aiFindings.filter(
+      (finding) => finding.status === "rejected"
+    ).length;
+
+    if (approvedFindings.length === 0) {
+      throw new Error(
+        "No approved findings found. Approve at least one finding before generating the report."
+      );
+    }
+
+    const riskGraph = orchestrator.recomputeRiskGraph({
+      workspace_id,
+      actor: resolvedActor,
+    });
+
+    const report = await generateApprovedFindingsReportWithOpenAi({
+      workspace_id,
+      approved_findings: approvedFindings,
+      pending_count: pendingCount,
+      rejected_count: rejectedCount,
+      risk_graph: riskGraph,
+      model,
+      api_key: openaiApiKey,
+    });
+
+    const pdfBase64 = generateExecutiveReportPdfBase64({
+      workspace_id,
+      generated_at: new Date().toISOString(),
+      approved_count: approvedFindings.length,
+      pending_count: pendingCount,
+      rejected_count: rejectedCount,
+      report,
+    });
+
+    const fileName = `approved-findings-report-${workspace_id}-${new Date()
+      .toISOString()
+      .slice(0, 10)}.pdf`;
+
+    return object({
+      workspace_id,
+      report: {
+        generated_at: new Date().toISOString(),
+        approved_count: approvedFindings.length,
+        pending_count: pendingCount,
+        rejected_count: rejectedCount,
+        report_title: report.report_title,
+        executive_summary: report.executive_summary,
+        key_points: report.key_points,
+        approved_findings_digest: report.approved_findings_digest,
+        final_recommendation: report.final_recommendation,
+        pdf: {
+          file_name: fileName,
+          mime_type: "application/pdf",
+          base64: pdfBase64,
+        },
+      },
+    });
   }
 );
 
@@ -1208,6 +1616,7 @@ type OpenAiDocumentSource =
 const openAiFindingSchema = z.object({
   title: z.string().min(3),
   summary: z.string().min(8),
+  management_points: z.array(z.string().min(6).max(180)).min(2).max(5),
   severity: riskSeveritySchema,
   tower: diligenceTowerSchema,
   probability: z.number(),
@@ -1226,11 +1635,13 @@ interface OpenAiWidgetFinding {
   document_name: string;
   title: string;
   summary: string;
+  management_points: string[];
   tower: z.infer<typeof diligenceTowerSchema>;
   severity: z.infer<typeof riskSeveritySchema>;
   probability: number;
   confidence: number;
   impact_value: number;
+  status: AiFindingStatus;
 }
 
 interface OpenAiWidgetDocument {
@@ -1241,6 +1652,75 @@ interface OpenAiWidgetDocument {
   bytes_sent?: number;
   chars_sent?: number;
   summary: string;
+}
+
+const plainEnglishComparisonSchema = z.object({
+  comparison_result: z.enum([
+    "supported",
+    "partially_supported",
+    "not_supported",
+    "unclear",
+  ]),
+  legal_plaintext_assessment: z.string().min(20),
+  executive_points: z.array(z.string().min(6).max(180)).min(2).max(5),
+  evidence_points: z.array(z.string()).default([]),
+  recalibrated_parameters: z.object({
+    downside_multiplier: z.number(),
+    synergy_multiplier: z.number(),
+    integration_cost: z.number(),
+  }),
+  management_explanation: z.string().min(20),
+});
+
+const approvedReportSchema = z.object({
+  report_title: z.string().min(6).max(140),
+  executive_summary: z.string().min(30).max(1200),
+  key_points: z.array(z.string().min(8).max(220)).min(3).max(8),
+  approved_findings_digest: z
+    .array(
+      z.object({
+        finding_id: z.string().min(4),
+        headline: z.string().min(6).max(120),
+        business_impact: z.string().min(12).max(260),
+        recommended_action: z.string().min(12).max(260),
+      })
+    )
+    .min(1)
+    .max(20),
+  final_recommendation: z.string().min(20).max(500),
+});
+
+function getWorkspaceAiFindingMap(
+  workspaceId: string
+): Map<string, StoredAiFinding> {
+  if (!aiFindingsByWorkspace.has(workspaceId)) {
+    aiFindingsByWorkspace.set(workspaceId, new Map());
+  }
+  return aiFindingsByWorkspace.get(workspaceId)!;
+}
+
+function upsertWorkspaceAiFindings(
+  workspaceId: string,
+  findings: StoredAiFinding[]
+): void {
+  const map = getWorkspaceAiFindingMap(workspaceId);
+  map.clear();
+  for (const finding of findings) {
+    map.set(finding.finding_id, finding);
+  }
+}
+
+function requireStoredAiFinding(
+  workspaceId: string,
+  findingId: string
+): StoredAiFinding {
+  const finding = getWorkspaceAiFindingMap(workspaceId).get(findingId);
+  if (!finding) {
+    throw new Error(
+      `AI finding '${findingId}' not found in workspace '${workspaceId}'. Re-run analyze_documents_with_openai to refresh findings.`
+    );
+  }
+  return finding;
 }
 
 async function loadWorkspaceDocumentsFromSupabase(
@@ -1288,6 +1768,20 @@ async function loadWorkspaceDocumentsFromSupabase(
       created_at: asOptionalString(row.created_at) ?? new Date().toISOString(),
     }))
     .filter((doc) => doc.workspace_id === workspaceId);
+}
+
+async function loadWorkspaceDocumentByIdFromSupabase(
+  workspaceId: string,
+  documentId: string
+): Promise<SupabaseDocumentRow> {
+  const docs = await loadWorkspaceDocumentsFromSupabase(workspaceId);
+  const doc = docs.find((item) => item.document_id === documentId);
+  if (!doc) {
+    throw new Error(
+      `Document '${documentId}' not found in workspace '${workspaceId}'.`
+    );
+  }
+  return doc;
 }
 
 async function resolveDocumentContentForOpenAi(
@@ -1394,8 +1888,18 @@ async function analyzeDocumentWithOpenAi(args: {
           type: "object",
           additionalProperties: false,
           properties: {
-            title: { type: "string" },
-            summary: { type: "string" },
+            title: { type: "string", minLength: 6, maxLength: 90 },
+            summary: { type: "string", minLength: 20, maxLength: 240 },
+            management_points: {
+              type: "array",
+              minItems: 2,
+              maxItems: 5,
+              items: {
+                type: "string",
+                minLength: 6,
+                maxLength: 180,
+              },
+            },
             severity: {
               type: "string",
               enum: ["low", "medium", "high", "critical"],
@@ -1419,6 +1923,7 @@ async function analyzeDocumentWithOpenAi(args: {
           required: [
             "title",
             "summary",
+            "management_points",
             "severity",
             "tower",
             "probability",
@@ -1432,9 +1937,13 @@ async function analyzeDocumentWithOpenAi(args: {
   } as const;
 
   const systemPrompt = [
-    "You are a senior M&A due-diligence analyst.",
+    "You are a senior M&A due-diligence analyst preparing output for top management.",
     "Analyze the provided source document for diligence risks and opportunities.",
     "Return findings only from evidence in the provided source.",
+    "Write concise, specific, plain-English output.",
+    "Each finding summary must be one short paragraph (max 2 sentences).",
+    "Each finding must include management_points as short bullet-style statements suitable for executives.",
+    "Avoid jargon, avoid hedging, avoid long legal prose.",
     "If there are no material findings, return an empty findings array.",
   ].join(" ");
 
@@ -1508,6 +2017,501 @@ async function analyzeDocumentWithOpenAi(args: {
     document_summary: validated.document_summary,
     findings: validated.findings.slice(0, args.max_findings_per_document),
   };
+}
+
+async function comparePlainEnglishWithDocumentUsingOpenAi(args: {
+  workspace_id: string;
+  finding: StoredAiFinding;
+  source_document: SupabaseDocumentRow;
+  source: OpenAiDocumentSource;
+  plain_english: string;
+  model: string;
+  api_key: string;
+}): Promise<z.infer<typeof plainEnglishComparisonSchema>> {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      comparison_result: {
+        type: "string",
+        enum: ["supported", "partially_supported", "not_supported", "unclear"],
+      },
+      legal_plaintext_assessment: { type: "string", minLength: 20, maxLength: 300 },
+      executive_points: {
+        type: "array",
+        minItems: 2,
+        maxItems: 5,
+        items: { type: "string", minLength: 6, maxLength: 180 },
+      },
+      evidence_points: { type: "array", items: { type: "string" } },
+      recalibrated_parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          downside_multiplier: { type: "number" },
+          synergy_multiplier: { type: "number" },
+          integration_cost: { type: "number" },
+        },
+        required: [
+          "downside_multiplier",
+          "synergy_multiplier",
+          "integration_cost",
+        ],
+      },
+      management_explanation: { type: "string" },
+    },
+    required: [
+      "comparison_result",
+      "legal_plaintext_assessment",
+      "executive_points",
+      "evidence_points",
+      "recalibrated_parameters",
+      "management_explanation",
+    ],
+  } as const;
+
+  const systemPrompt = [
+    "You are a legal and financial diligence specialist for mergers and acquisitions.",
+    "Compare the lawyer's plain-English statement with the exact source document.",
+    "State whether the statement is supported, partially supported, not supported, or unclear.",
+    "Then recalculate scenario parameters that reflect the risk interpretation.",
+    "Keep response factual and grounded in document evidence only.",
+    "Write short, clear statements that non-technical executives can understand quickly.",
+    "Provide executive_points as concise bullet-style lines.",
+  ].join(" ");
+
+  const userInstruction = [
+    `Workspace: ${args.workspace_id}`,
+    `Finding ID: ${args.finding.finding_id}`,
+    `Finding title: ${args.finding.title}`,
+    `Document ID: ${args.source_document.document_id}`,
+    `Document Name: ${args.source_document.document_name}`,
+    `Lawyer plain-English input: ${args.plain_english}`,
+  ].join("\n");
+
+  const userContent: Array<Record<string, unknown>> = [
+    { type: "input_text", text: userInstruction },
+  ];
+  if (args.source.type === "file_bytes") {
+    userContent.push({
+      type: "input_file",
+      filename: args.source.file_name,
+      file_data: `data:${args.source.mime_type};base64,${args.source.base64}`,
+    });
+  } else {
+    userContent.push({
+      type: "input_text",
+      text: args.source.text,
+    });
+  }
+
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${args.api_key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: args.model,
+      temperature: 0.1,
+      input: [
+        {
+          role: "system",
+          content: [{ type: "input_text", text: systemPrompt }],
+        },
+        {
+          role: "user",
+          content: userContent,
+        },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "ma_finding_plain_english_comparison",
+          schema,
+          strict: true,
+        },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(
+      `OpenAI plain-English comparison failed (${res.status}) for finding '${args.finding.finding_id}': ${body}`
+    );
+  }
+
+  const responseJson = await res.json();
+  const responseText = extractOpenAiOutputText(responseJson);
+  const parsed = parseJsonPayload(responseText);
+  return plainEnglishComparisonSchema.parse(parsed);
+}
+
+function normalizeRecalibratedScenarioAssumptions(input: {
+  downside_multiplier: number;
+  synergy_multiplier: number;
+  integration_cost: number;
+}): ScenarioAssumptions {
+  return {
+    downside_multiplier: round2(
+      clampNumber(input.downside_multiplier, 0.5, 2.5)
+    ),
+    synergy_multiplier: round2(clampNumber(input.synergy_multiplier, 0.3, 1.9)),
+    integration_cost: Math.round(
+      clampNumber(input.integration_cost, 0, 100_000_000)
+    ),
+  };
+}
+
+const GRAPH_BAR_PALETTE = [
+  "#1d4ed8",
+  "#2563eb",
+  "#0284c7",
+  "#0f766e",
+  "#6d28d9",
+  "#b45309",
+  "#be123c",
+];
+
+function buildGraphBreakdown(
+  values: string[],
+  colorMap: Record<string, string>
+): Array<{
+  key: string;
+  label: string;
+  count: number;
+  color: string;
+}> {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([key, count]) => ({
+      key,
+      label: key.replace(/_/g, " "),
+      count,
+      color: colorMap[key] ?? "#475569",
+    }));
+}
+
+async function generateApprovedFindingsReportWithOpenAi(args: {
+  workspace_id: string;
+  approved_findings: StoredAiFinding[];
+  pending_count: number;
+  rejected_count: number;
+  risk_graph: RiskGraph;
+  model: string;
+  api_key: string;
+}): Promise<z.infer<typeof approvedReportSchema>> {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      report_title: { type: "string", minLength: 6, maxLength: 140 },
+      executive_summary: { type: "string", minLength: 30, maxLength: 1200 },
+      key_points: {
+        type: "array",
+        minItems: 3,
+        maxItems: 8,
+        items: { type: "string", minLength: 8, maxLength: 220 },
+      },
+      approved_findings_digest: {
+        type: "array",
+        minItems: 1,
+        maxItems: 20,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            finding_id: { type: "string", minLength: 4 },
+            headline: { type: "string", minLength: 6, maxLength: 120 },
+            business_impact: { type: "string", minLength: 12, maxLength: 260 },
+            recommended_action: {
+              type: "string",
+              minLength: 12,
+              maxLength: 260,
+            },
+          },
+          required: [
+            "finding_id",
+            "headline",
+            "business_impact",
+            "recommended_action",
+          ],
+        },
+      },
+      final_recommendation: { type: "string", minLength: 20, maxLength: 500 },
+    },
+    required: [
+      "report_title",
+      "executive_summary",
+      "key_points",
+      "approved_findings_digest",
+      "final_recommendation",
+    ],
+  } as const;
+
+  const systemPrompt = [
+    "You are preparing an executive M&A report for senior management.",
+    "Use only the provided approved findings and risk metrics.",
+    "Write concise, specific, decision-oriented text in plain business English.",
+    "Prefer short bullet-style points over paragraphs.",
+    "Do not include rejected or pending findings in recommendations.",
+  ].join(" ");
+
+  const userText = [
+    `Workspace: ${args.workspace_id}`,
+    `Approved findings count: ${args.approved_findings.length}`,
+    `Pending findings count: ${args.pending_count}`,
+    `Rejected findings count: ${args.rejected_count}`,
+    `Risk total weighted: ${args.risk_graph.total_weighted_risk}`,
+    "Approved findings:",
+    JSON.stringify(
+      args.approved_findings.map((finding) => ({
+        finding_id: finding.finding_id,
+        title: finding.title,
+        summary: finding.summary,
+        management_points: finding.management_points,
+        tower: finding.tower,
+        severity: finding.severity,
+        probability: finding.probability,
+        confidence: finding.confidence,
+        impact_value: finding.impact_value,
+        document_name: finding.document_name,
+      }))
+    ),
+  ].join("\n");
+
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${args.api_key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: args.model,
+      temperature: 0.1,
+      input: [
+        {
+          role: "system",
+          content: [{ type: "input_text", text: systemPrompt }],
+        },
+        {
+          role: "user",
+          content: [{ type: "input_text", text: userText }],
+        },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "approved_findings_executive_report",
+          schema,
+          strict: true,
+        },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(
+      `OpenAI report generation failed (${res.status}) for workspace '${args.workspace_id}': ${body}`
+    );
+  }
+
+  const responseJson = await res.json();
+  const responseText = extractOpenAiOutputText(responseJson);
+  const parsed = parseJsonPayload(responseText);
+  return approvedReportSchema.parse(parsed);
+}
+
+function generateExecutiveReportPdfBase64(args: {
+  workspace_id: string;
+  generated_at: string;
+  approved_count: number;
+  pending_count: number;
+  rejected_count: number;
+  report: z.infer<typeof approvedReportSchema>;
+}): string {
+  const lines: string[] = [
+    args.report.report_title,
+    `Generated: ${args.generated_at}`,
+    `Workspace: ${args.workspace_id}`,
+    `Approved findings: ${args.approved_count} | Pending: ${args.pending_count} | Rejected: ${args.rejected_count}`,
+    "",
+    "Executive Summary",
+    args.report.executive_summary,
+    "",
+    "Key Points",
+    ...args.report.key_points.map((point, index) => `${index + 1}. ${point}`),
+    "",
+    "Approved Findings Digest",
+    ...args.report.approved_findings_digest.flatMap((item) => [
+      `Finding ${item.finding_id}: ${item.headline}`,
+      `Impact: ${item.business_impact}`,
+      `Recommended action: ${item.recommended_action}`,
+      "",
+    ]),
+    "Final Recommendation",
+    args.report.final_recommendation,
+  ];
+
+  return buildSimplePdfBase64(lines);
+}
+
+function buildSimplePdfBase64(rawLines: string[]): string {
+  const maxChars = 100;
+  const lineHeight = 14;
+  const margin = 50;
+  const pageWidth = 595;
+  const pageHeight = 842;
+  const maxLinesPerPage = Math.max(
+    1,
+    Math.floor((pageHeight - margin * 2) / lineHeight)
+  );
+
+  const wrappedLines = rawLines
+    .flatMap((line) => wrapPdfLine(line, maxChars))
+    .map((line) => line.trimEnd());
+  const lines = wrappedLines.length > 0 ? wrappedLines : [" "];
+
+  const pages: string[][] = [];
+  for (let i = 0; i < lines.length; i += maxLinesPerPage) {
+    pages.push(lines.slice(i, i + maxLinesPerPage));
+  }
+
+  const objects = new Map<number, string>();
+  let nextObjectId = 1;
+  const catalogId = nextObjectId++;
+  const pagesId = nextObjectId++;
+  const fontId = nextObjectId++;
+  objects.set(
+    fontId,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+  );
+
+  const pageIds: number[] = [];
+  for (const pageLines of pages) {
+    const pageId = nextObjectId++;
+    const contentId = nextObjectId++;
+    const stream = buildPdfContentStream({
+      lines: pageLines,
+      margin,
+      pageHeight,
+      lineHeight,
+    });
+    objects.set(
+      contentId,
+      `<< /Length ${Buffer.byteLength(stream, "utf8")} >>\nstream\n${stream}\nendstream`
+    );
+    objects.set(
+      pageId,
+      [
+        "<<",
+        "/Type /Page",
+        `/Parent ${pagesId} 0 R`,
+        `/MediaBox [0 0 ${pageWidth} ${pageHeight}]`,
+        `/Resources << /Font << /F1 ${fontId} 0 R >> >>`,
+        `/Contents ${contentId} 0 R`,
+        ">>",
+      ].join("\n")
+    );
+    pageIds.push(pageId);
+  }
+
+  objects.set(
+    pagesId,
+    `<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] /Count ${pageIds.length} >>`
+  );
+  objects.set(catalogId, `<< /Type /Catalog /Pages ${pagesId} 0 R >>`);
+
+  const objectCount = nextObjectId - 1;
+  const offsets: number[] = new Array(objectCount + 1).fill(0);
+  let pdf = "%PDF-1.4\n";
+  for (let id = 1; id <= objectCount; id += 1) {
+    const body = objects.get(id);
+    if (!body) {
+      throw new Error(`PDF object ${id} is missing`);
+    }
+    offsets[id] = Buffer.byteLength(pdf, "utf8");
+    pdf += `${id} 0 obj\n${body}\nendobj\n`;
+  }
+
+  const xrefStart = Buffer.byteLength(pdf, "utf8");
+  pdf += `xref\n0 ${objectCount + 1}\n`;
+  pdf += "0000000000 65535 f \n";
+  for (let id = 1; id <= objectCount; id += 1) {
+    pdf += `${offsets[id]!.toString().padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objectCount + 1} /Root ${catalogId} 0 R >>\n`;
+  pdf += `startxref\n${xrefStart}\n%%EOF`;
+
+  return Buffer.from(pdf, "utf8").toString("base64");
+}
+
+function buildPdfContentStream(args: {
+  lines: string[];
+  margin: number;
+  pageHeight: number;
+  lineHeight: number;
+}): string {
+  const startY = args.pageHeight - args.margin;
+  const commands = [
+    "BT",
+    "/F1 11 Tf",
+    `${args.lineHeight} TL`,
+    `${args.margin} ${startY} Td`,
+  ];
+  args.lines.forEach((line, index) => {
+    if (index > 0) {
+      commands.push("T*");
+    }
+    commands.push(`(${escapePdfText(line)}) Tj`);
+  });
+  commands.push("ET");
+  return commands.join("\n");
+}
+
+function wrapPdfLine(line: string, maxChars: number): string[] {
+  const normalized = line.replace(/\s+/g, " ").trim();
+  if (normalized.length === 0) {
+    return [""];
+  }
+  if (normalized.length <= maxChars) {
+    return [normalized];
+  }
+
+  const words = normalized.split(" ");
+  const lines: string[] = [];
+  let current = "";
+  for (const word of words) {
+    if (!current) {
+      current = word;
+      continue;
+    }
+    if (`${current} ${word}`.length <= maxChars) {
+      current = `${current} ${word}`;
+      continue;
+    }
+    lines.push(current);
+    current = word;
+  }
+  if (current) {
+    lines.push(current);
+  }
+  return lines;
+}
+
+function escapePdfText(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)")
+    .replace(/[\u0000-\u001f\u007f]/g, " ");
 }
 
 function extractOpenAiOutputText(payload: unknown): string {

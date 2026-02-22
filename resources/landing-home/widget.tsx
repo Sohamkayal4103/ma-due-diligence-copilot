@@ -50,9 +50,91 @@ interface IntakeForm {
 
 interface AnalysisFindingPreview {
   finding_id: string;
+  document_id: string;
   document_name: string;
   title: string;
+  summary: string;
+  management_points: string[];
+  tower: string;
   severity: string;
+  status: "requires_approval" | "approved" | "rejected";
+  probability: number;
+  confidence: number;
+  impact_value: number;
+}
+
+interface AnalysisScenarioOutput {
+  comparison_result: string;
+  legal_plaintext_assessment: string;
+  executive_points: string[];
+  evidence_points: string[];
+  recalibrated_parameters: {
+    downside_multiplier: number;
+    synergy_multiplier: number;
+    integration_cost: number;
+  };
+  management_explanation: string;
+  management_plaintext: string;
+  scenario_result: {
+    valuation_delta: number;
+    integration_delta: number;
+    risk_delta: number;
+    confidence_band: [number, number];
+  } | null;
+}
+
+interface VisualGraphBar {
+  key: string;
+  label: string;
+  value: number;
+  color: string;
+}
+
+interface VisualGraphBreakdown {
+  key: string;
+  label: string;
+  count: number;
+  color: string;
+}
+
+interface VisualGraphPayload {
+  title: string;
+  subtitle: string;
+  total_weighted_risk: number;
+  open_findings: number;
+  requires_approval: number;
+  y_max: number;
+  bars: VisualGraphBar[];
+  status_breakdown: VisualGraphBreakdown[];
+  severity_breakdown: VisualGraphBreakdown[];
+  scenario_overlay?: {
+    label: string;
+    risk_delta: number;
+    valuation_delta: number;
+    integration_delta: number;
+  } | null;
+}
+
+interface ApprovedReportPayload {
+  generated_at: string;
+  approved_count: number;
+  pending_count: number;
+  rejected_count: number;
+  report_title: string;
+  executive_summary: string;
+  key_points: string[];
+  approved_findings_digest: Array<{
+    finding_id: string;
+    headline: string;
+    business_impact: string;
+    recommended_action: string;
+  }>;
+  final_recommendation: string;
+  pdf: {
+    file_name: string;
+    mime_type: string;
+    base64: string;
+  };
 }
 
 export const widgetMetadata: WidgetMetadata = {
@@ -159,6 +241,21 @@ export default function LandingHomeWidget() {
   const [analysisFindings, setAnalysisFindings] = useState<
     AnalysisFindingPreview[]
   >([]);
+  const [selectedFindingId, setSelectedFindingId] = useState<string | null>(
+    null
+  );
+  const [analysisDecisionReason, setAnalysisDecisionReason] = useState("");
+  const [analysisScenarioInput, setAnalysisScenarioInput] = useState("");
+  const [analysisScenarioOutput, setAnalysisScenarioOutput] =
+    useState<AnalysisScenarioOutput | null>(null);
+  const [analysisGraphOutput, setAnalysisGraphOutput] =
+    useState<VisualGraphPayload | null>(null);
+  const [approvedReport, setApprovedReport] =
+    useState<ApprovedReportPayload | null>(null);
+  const [isUpdatingFindingStatus, setIsUpdatingFindingStatus] = useState(false);
+  const [isRunningScenario, setIsRunningScenario] = useState(false);
+  const [isLoadingGraph, setIsLoadingGraph] = useState(false);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
 
   const palette = useMemo(() => {
     const dark = theme === "dark";
@@ -178,6 +275,9 @@ export default function LandingHomeWidget() {
       inputText: dark ? "#dde7ff" : "#0f1728",
     };
   }, [theme]);
+  const selectedAnalysisFinding =
+    analysisFindings.find((finding) => finding.finding_id === selectedFindingId) ??
+    null;
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -240,13 +340,13 @@ export default function LandingHomeWidget() {
                 type="button"
                 style={buttonStyle(palette)}
                 onClick={() => {
-                setCurrentView("home");
-                setSubmitMessage(null);
-                setAnalysisMessage(null);
-              }}
-            >
-              Back
-            </button>
+                  setCurrentView("home");
+                  setSubmitMessage(null);
+                  clearAnalysisOutputs();
+                }}
+              >
+                Back
+              </button>
             </div>
           </div>
 
@@ -528,6 +628,21 @@ export default function LandingHomeWidget() {
                 ? "Analyzing Documents..."
                 : "Analyze Documents (OpenAI)"}
             </button>
+            <button
+              type="button"
+              style={buttonStyle(palette)}
+              onClick={() => void generateApprovedFindingsReport()}
+              disabled={
+                isSubmitting ||
+                isAnalyzingDocuments ||
+                isGeneratingReport ||
+                analysisFindings.length === 0
+              }
+            >
+              {isGeneratingReport
+                ? "Generating Report..."
+                : "Generate Approved Report (PDF)"}
+            </button>
           </div>
           {analysisMessage ? (
             <p style={{ marginTop: 10, color: palette.muted }}>{analysisMessage}</p>
@@ -535,12 +650,25 @@ export default function LandingHomeWidget() {
           {analysisFindings.length > 0 ? (
             <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
               {analysisFindings.map((finding) => (
-                <article
+                <button
                   key={finding.finding_id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedFindingId(finding.finding_id);
+                    setAnalysisScenarioOutput(null);
+                    setAnalysisGraphOutput(null);
+                  }}
                   style={{
                     border: `1px solid ${palette.line}`,
                     borderRadius: 10,
                     padding: 10,
+                    background:
+                      selectedFindingId === finding.finding_id
+                        ? palette.chip
+                        : palette.card,
+                    color: palette.text,
+                    textAlign: "left",
+                    cursor: "pointer",
                   }}
                 >
                   <div style={{ fontWeight: 700 }}>{finding.title}</div>
@@ -551,10 +679,243 @@ export default function LandingHomeWidget() {
                     Document: {finding.document_name}
                   </div>
                   <div style={{ color: palette.muted, fontSize: 13 }}>
-                    Severity: {finding.severity}
+                    Severity: {finding.severity} | Status: {finding.status}
                   </div>
-                </article>
+                </button>
               ))}
+            </div>
+          ) : null}
+          {selectedAnalysisFinding ? (
+            <div
+              style={{
+                marginTop: 12,
+                border: `1px solid ${palette.line}`,
+                borderRadius: 10,
+                padding: 12,
+                background: palette.card,
+              }}
+            >
+              <h4 style={{ margin: "0 0 8px 0" }}>
+                Finding Detail: {selectedAnalysisFinding.title}
+              </h4>
+              <p style={{ marginTop: 0, color: palette.muted }}>
+                {selectedAnalysisFinding.summary}
+              </p>
+              <p style={{ marginTop: 0, color: palette.muted, fontSize: 13 }}>
+                ID: {selectedAnalysisFinding.finding_id} | Document:{" "}
+                {selectedAnalysisFinding.document_name} | Tower:{" "}
+                {selectedAnalysisFinding.tower}
+              </p>
+              <p style={{ marginTop: 0, color: palette.muted, fontSize: 13 }}>
+                Status: {selectedAnalysisFinding.status} | Probability:{" "}
+                {selectedAnalysisFinding.probability.toFixed(2)} | Confidence:{" "}
+                {selectedAnalysisFinding.confidence.toFixed(2)} | Impact:{" "}
+                {selectedAnalysisFinding.impact_value.toLocaleString()}
+              </p>
+              {selectedAnalysisFinding.management_points.length > 0 ? (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>
+                    Executive Points
+                  </div>
+                  <ul style={{ marginTop: 6, color: palette.muted }}>
+                    {selectedAnalysisFinding.management_points.map((point) => (
+                      <li key={point}>{point}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              <Field
+                label="Decision Note (optional)"
+                value={analysisDecisionReason}
+                onChange={setAnalysisDecisionReason}
+                multiline
+                palette={palette}
+              />
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                <button
+                  type="button"
+                  style={buttonStyle(palette)}
+                  disabled={isUpdatingFindingStatus}
+                  onClick={() => void decideSelectedFinding("approved")}
+                >
+                  {isUpdatingFindingStatus ? "Updating..." : "Approve Finding"}
+                </button>
+                <button
+                  type="button"
+                  style={buttonStyle(palette)}
+                  disabled={isUpdatingFindingStatus}
+                  onClick={() => void decideSelectedFinding("rejected")}
+                >
+                  {isUpdatingFindingStatus ? "Updating..." : "Reject Finding"}
+                </button>
+              </div>
+
+              <div style={{ marginTop: 12 }}>
+                <Field
+                  label="Lawyer Plain-English Scenario Input"
+                  value={analysisScenarioInput}
+                  onChange={setAnalysisScenarioInput}
+                  multiline
+                  palette={palette}
+                />
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                  <button
+                    type="button"
+                    style={buttonStyle(palette)}
+                    disabled={isRunningScenario}
+                    onClick={() => void runScenarioForSelectedFinding()}
+                  >
+                    {isRunningScenario
+                      ? "Running Scenario..."
+                      : "Run Plain-English Scenario"}
+                  </button>
+                  <button
+                    type="button"
+                    style={buttonStyle(palette)}
+                    disabled={isLoadingGraph}
+                    onClick={() => void loadWorkspaceGraph()}
+                  >
+                    {isLoadingGraph ? "Loading Graph..." : "View Graph"}
+                  </button>
+                </div>
+              </div>
+
+              {analysisScenarioOutput ? (
+                <div
+                  style={{
+                    marginTop: 10,
+                    border: `1px solid ${palette.line}`,
+                    borderRadius: 8,
+                    padding: 10,
+                    background: palette.inputBg,
+                  }}
+                >
+                  <div style={{ fontWeight: 700 }}>Plain-English Result</div>
+                  <p style={{ marginTop: 6, color: palette.muted }}>
+                    {analysisScenarioOutput.legal_plaintext_assessment}
+                  </p>
+                  <p style={{ marginTop: 6, color: palette.muted }}>
+                    Comparison: {analysisScenarioOutput.comparison_result}
+                  </p>
+                  {analysisScenarioOutput.executive_points.length > 0 ? (
+                    <ul style={{ marginTop: 6, color: palette.muted }}>
+                      {analysisScenarioOutput.executive_points.map((point) => (
+                        <li key={point}>{point}</li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {analysisScenarioOutput.evidence_points.length > 0 ? (
+                    <ul style={{ marginTop: 6, color: palette.muted }}>
+                      {analysisScenarioOutput.evidence_points.map((point) => (
+                        <li key={point}>{point}</li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  <p style={{ marginTop: 6, color: palette.muted }}>
+                    Recalibrated parameters: downside_multiplier=
+                    {
+                      analysisScenarioOutput.recalibrated_parameters
+                        .downside_multiplier
+                    }
+                    , synergy_multiplier=
+                    {
+                      analysisScenarioOutput.recalibrated_parameters
+                        .synergy_multiplier
+                    }
+                    , integration_cost=
+                    {analysisScenarioOutput.recalibrated_parameters.integration_cost}
+                  </p>
+                  {analysisScenarioOutput.scenario_result ? (
+                    <p style={{ marginTop: 6, color: palette.muted }}>
+                      Scenario output: valuation_delta=
+                      {analysisScenarioOutput.scenario_result.valuation_delta.toLocaleString()}
+                      , integration_delta=
+                      {analysisScenarioOutput.scenario_result.integration_delta.toLocaleString()}
+                      , risk_delta=
+                      {analysisScenarioOutput.scenario_result.risk_delta.toLocaleString()}
+                    </p>
+                  ) : null}
+                  <p style={{ marginTop: 6, color: palette.muted }}>
+                    {analysisScenarioOutput.management_explanation}
+                  </p>
+                  <p style={{ marginTop: 6, color: palette.muted }}>
+                    {analysisScenarioOutput.management_plaintext}
+                  </p>
+                </div>
+              ) : null}
+
+              {analysisGraphOutput ? (
+                <div
+                  style={{
+                    marginTop: 10,
+                    border: `1px solid ${palette.line}`,
+                    borderRadius: 8,
+                    padding: 10,
+                    background: palette.inputBg,
+                  }}
+                >
+                  <div style={{ fontWeight: 700 }}>Risk Graph Snapshot</div>
+                  <p style={{ marginTop: 6, color: palette.muted }}>
+                    Total weighted risk:{" "}
+                    {analysisGraphOutput.total_weighted_risk.toLocaleString()} |
+                    Open findings: {analysisGraphOutput.open_findings} |
+                    Requires approval: {analysisGraphOutput.requires_approval}
+                  </p>
+                  {renderVisualGraph(analysisGraphOutput, palette)}
+                  {analysisGraphOutput.scenario_overlay ? (
+                    <p style={{ marginTop: 8, color: palette.muted }}>
+                      {analysisGraphOutput.scenario_overlay.label}: risk_delta=
+                      {analysisGraphOutput.scenario_overlay.risk_delta.toLocaleString()}
+                      , valuation_delta=
+                      {analysisGraphOutput.scenario_overlay.valuation_delta.toLocaleString()}
+                      , integration_delta=
+                      {analysisGraphOutput.scenario_overlay.integration_delta.toLocaleString()}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {approvedReport ? (
+            <div
+              style={{
+                marginTop: 12,
+                border: `1px solid ${palette.line}`,
+                borderRadius: 10,
+                padding: 12,
+                background: palette.card,
+              }}
+            >
+              <h4 style={{ margin: "0 0 8px 0" }}>{approvedReport.report_title}</h4>
+              <p style={{ marginTop: 0, color: palette.muted }}>
+                {approvedReport.executive_summary}
+              </p>
+              <p style={{ marginTop: 0, color: palette.muted, fontSize: 13 }}>
+                Approved: {approvedReport.approved_count} | Pending:{" "}
+                {approvedReport.pending_count} | Rejected:{" "}
+                {approvedReport.rejected_count}
+              </p>
+              <ul style={{ marginTop: 8, color: palette.muted }}>
+                {approvedReport.key_points.map((point) => (
+                  <li key={point}>{point}</li>
+                ))}
+              </ul>
+              <p style={{ marginTop: 8, color: palette.muted }}>
+                {approvedReport.final_recommendation}
+              </p>
+              <button
+                type="button"
+                style={buttonStyle(palette)}
+                onClick={() =>
+                  downloadBase64Pdf(
+                    approvedReport.pdf.base64,
+                    approvedReport.pdf.file_name
+                  )
+                }
+              >
+                Download PDF Report
+              </button>
             </div>
           ) : null}
         </section>
@@ -564,10 +925,20 @@ export default function LandingHomeWidget() {
             <button
               type="button"
               style={buttonStyle(palette)}
-              onClick={submitIntake}
+              onClick={() => void submitIntake()}
               disabled={isSubmitting}
             >
               {isSubmitting ? "Submitting..." : "Submit Intake"}
+            </button>
+            <button
+              type="button"
+              style={buttonStyle(palette)}
+              onClick={() => void submitIntake({ analyzeAfterSubmit: true })}
+              disabled={isSubmitting || isAnalyzingDocuments}
+            >
+              {isSubmitting || isAnalyzingDocuments
+                ? "Submitting + Analyzing..."
+                : "Submit Intake + Analyze Documents"}
             </button>
             <button
               type="button"
@@ -579,8 +950,7 @@ export default function LandingHomeWidget() {
                 setCreatedWorkspaceId(null);
                 setCreatedDealId(null);
                 setAnalysisWorkspaceId("");
-                setAnalysisMessage(null);
-                setAnalysisFindings([]);
+                clearAnalysisOutputs();
               }}
               disabled={isSubmitting}
             >
@@ -759,8 +1129,7 @@ export default function LandingHomeWidget() {
     setCreatedWorkspaceId(null);
     setCreatedDealId(null);
     setAnalysisWorkspaceId("");
-    setAnalysisMessage(null);
-    setAnalysisFindings([]);
+    clearAnalysisOutputs();
     setForm((prev) => ({
       ...prev,
       deal_name: "",
@@ -782,10 +1151,10 @@ export default function LandingHomeWidget() {
     setCreatedWorkspaceId(null);
     setCreatedDealId(null);
     setAnalysisWorkspaceId("");
+    clearAnalysisOutputs();
     setAnalysisMessage(
       "Sample demo details loaded. Submit intake first, then run Analyze Documents."
     );
-    setAnalysisFindings([]);
     setSubmitMessage(
       "Sample demo details loaded. Review values, then click Submit Intake."
     );
@@ -857,7 +1226,9 @@ export default function LandingHomeWidget() {
     }
   }
 
-  async function submitIntake() {
+  async function submitIntake(
+    options: { analyzeAfterSubmit?: boolean } = {}
+  ): Promise<void> {
     setIsSubmitting(true);
     setSubmitMessage(null);
     setCreatedWorkspaceId(null);
@@ -955,7 +1326,16 @@ export default function LandingHomeWidget() {
           : null
       );
       setAnalysisFindings([]);
+      setSelectedFindingId(null);
+      setAnalysisScenarioInput("");
+      setAnalysisDecisionReason("");
+      setAnalysisScenarioOutput(null);
+      setAnalysisGraphOutput(null);
+      setApprovedReport(null);
       setSubmitMessage("Deal intake submitted and persisted.");
+      if (options.analyzeAfterSubmit && workspaceId) {
+        await runOpenAiAnalysisByWorkspaceId(workspaceId);
+      }
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Unknown intake submission error.";
@@ -973,33 +1353,66 @@ export default function LandingHomeWidget() {
       );
       return;
     }
+    await runOpenAiAnalysisByWorkspaceId(workspaceId);
+  }
 
+  async function runOpenAiAnalysisByWorkspaceId(
+    workspaceId: string
+  ): Promise<void> {
+    const normalizedWorkspaceId = workspaceId.trim();
+    if (!normalizedWorkspaceId) {
+      setAnalysisMessage(
+        "Workspace ID is required. Submit intake first or paste a workspace ID."
+      );
+      return;
+    }
+    setAnalysisWorkspaceId(normalizedWorkspaceId);
     setIsAnalyzingDocuments(true);
     setAnalysisMessage(null);
     setAnalysisFindings([]);
+    setSelectedFindingId(null);
+    setAnalysisScenarioInput("");
+    setAnalysisDecisionReason("");
+    setAnalysisScenarioOutput(null);
+    setAnalysisGraphOutput(null);
+    setApprovedReport(null);
     try {
       const result = await callTool("analyze_documents_with_openai", {
-        workspace_id: workspaceId,
+        workspace_id: normalizedWorkspaceId,
         as_widget: false,
         max_findings_per_document: 5,
       });
       const structured = toObject(result.structuredContent);
       const findings = toObjectArray(structured.findings)
-        .map((item) => ({
-          finding_id: asString(item.finding_id) ?? "",
-          document_name: asString(item.document_name) ?? "Unknown document",
-          title: asString(item.title) ?? "Untitled finding",
-          severity: asString(item.severity) ?? "unknown",
-        }))
+        .map((item): AnalysisFindingPreview => {
+          const status = parseFindingStatus(item.status);
+          return {
+            finding_id: asString(item.finding_id) ?? "",
+            document_id: asString(item.document_id) ?? "",
+            document_name: asString(item.document_name) ?? "Unknown document",
+            title: asString(item.title) ?? "Untitled finding",
+            summary: asString(item.summary) ?? "",
+            management_points: toStringArray(item.management_points),
+            tower: asString(item.tower) ?? "unknown",
+            severity: asString(item.severity) ?? "unknown",
+            status,
+            probability: asNumber(item.probability) ?? 0,
+            confidence: asNumber(item.confidence) ?? 0,
+            impact_value: asNumber(item.impact_value) ?? 0,
+          };
+        })
         .filter((item) => item.finding_id.length > 0);
 
       const findingsTotal =
         typeof structured.findings_total === "number"
           ? structured.findings_total
           : findings.length;
-      setAnalysisFindings(findings.slice(0, 10));
+      setAnalysisFindings(findings);
+      if (findings.length > 0) {
+        setSelectedFindingId(findings[0]!.finding_id);
+      }
       setAnalysisMessage(
-        `AI analysis completed. Total findings: ${findingsTotal}. Showing up to 10 here.`
+        `AI analysis completed. Total findings: ${findingsTotal}. Click any finding to review and decide.`
       );
     } catch (err) {
       const message =
@@ -1007,6 +1420,266 @@ export default function LandingHomeWidget() {
       setAnalysisMessage(`Could not analyze documents: ${message}`);
     } finally {
       setIsAnalyzingDocuments(false);
+    }
+  }
+
+  async function decideSelectedFinding(
+    decision: "approved" | "rejected"
+  ): Promise<void> {
+    const workspaceId = analysisWorkspaceId.trim();
+    if (!workspaceId || !selectedAnalysisFinding) {
+      setAnalysisMessage("Select a finding first.");
+      return;
+    }
+
+    setIsUpdatingFindingStatus(true);
+    setAnalysisMessage(null);
+    try {
+      const result = await callTool("set_ai_finding_status", {
+        workspace_id: workspaceId,
+        finding_id: selectedAnalysisFinding.finding_id,
+        decision,
+        reason:
+          analysisDecisionReason.trim().length > 0
+            ? analysisDecisionReason
+            : undefined,
+      });
+      const structured = toObject(result.structuredContent);
+      const updatedFinding = toObject(structured.finding);
+      const updatedStatus = asString(updatedFinding.status);
+      setAnalysisFindings((prev) =>
+        prev.map((finding) =>
+          finding.finding_id === selectedAnalysisFinding.finding_id &&
+          (updatedStatus === "approved" ||
+            updatedStatus === "rejected" ||
+            updatedStatus === "requires_approval")
+            ? { ...finding, status: updatedStatus }
+            : finding
+        )
+      );
+      setAnalysisMessage(`Finding ${decision}.`);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Unknown status update error.";
+      setAnalysisMessage(`Could not update finding status: ${message}`);
+    } finally {
+      setIsUpdatingFindingStatus(false);
+    }
+  }
+
+  async function runScenarioForSelectedFinding(): Promise<void> {
+    const workspaceId = analysisWorkspaceId.trim();
+    if (!workspaceId || !selectedAnalysisFinding) {
+      setAnalysisMessage("Select a finding first.");
+      return;
+    }
+    if (analysisScenarioInput.trim().length < 12) {
+      setAnalysisMessage(
+        "Enter a plain-English scenario (at least 12 characters)."
+      );
+      return;
+    }
+
+    setIsRunningScenario(true);
+    setAnalysisScenarioOutput(null);
+    setAnalysisMessage(null);
+    try {
+      const result = await callTool("run_ai_finding_plaintext_scenario", {
+        workspace_id: workspaceId,
+        finding_id: selectedAnalysisFinding.finding_id,
+        plain_english: analysisScenarioInput,
+      });
+      const structured = toObject(result.structuredContent);
+      const comparison = toObject(structured.comparison);
+      const recalibrated = toObject(structured.recalibrated_parameters);
+      const scenarioResult = toObject(structured.scenario_result);
+
+      setAnalysisScenarioOutput({
+        comparison_result: asString(comparison.comparison_result) ?? "unclear",
+        legal_plaintext_assessment:
+          asString(comparison.legal_plaintext_assessment) ?? "",
+        executive_points: toStringArray(comparison.executive_points),
+        evidence_points: toStringArray(comparison.evidence_points),
+        recalibrated_parameters: {
+          downside_multiplier:
+            asNumber(recalibrated.downside_multiplier) ?? 1,
+          synergy_multiplier: asNumber(recalibrated.synergy_multiplier) ?? 1,
+          integration_cost: asNumber(recalibrated.integration_cost) ?? 0,
+        },
+        management_explanation:
+          asString(comparison.management_explanation) ?? "",
+        management_plaintext: asString(structured.management_plaintext) ?? "",
+        scenario_result:
+          scenarioResult && Object.keys(scenarioResult).length > 0
+            ? {
+                valuation_delta: asNumber(scenarioResult.valuation_delta) ?? 0,
+                integration_delta:
+                  asNumber(scenarioResult.integration_delta) ?? 0,
+                risk_delta: asNumber(scenarioResult.risk_delta) ?? 0,
+                confidence_band:
+                  toNumberPair(scenarioResult.confidence_band) ?? [0, 0],
+              }
+            : null,
+      });
+      setAnalysisMessage("Scenario run completed.");
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Unknown scenario execution error.";
+      setAnalysisMessage(`Could not run scenario: ${message}`);
+    } finally {
+      setIsRunningScenario(false);
+    }
+  }
+
+  async function loadWorkspaceGraph(): Promise<void> {
+    const workspaceId = analysisWorkspaceId.trim();
+    if (!workspaceId) {
+      setAnalysisMessage("Workspace ID is required.");
+      return;
+    }
+    setIsLoadingGraph(true);
+    setAnalysisGraphOutput(null);
+    setAnalysisMessage(null);
+    try {
+      const result = await callTool("generate_visual_risk_graph", {
+        workspace_id: workspaceId,
+        finding_id: selectedAnalysisFinding?.finding_id,
+        scenario_parameters: analysisScenarioOutput?.recalibrated_parameters,
+      });
+      const structured = toObject(result.structuredContent);
+      const graph = toObject(structured.graph);
+      const bars = toObjectArray(graph.bars)
+        .map((bar): VisualGraphBar | null => {
+          const label = asString(bar.label);
+          const key = asString(bar.key);
+          const value = asNumber(bar.value);
+          const color = asString(bar.color);
+          if (!label || !key || value === null || !color) {
+            return null;
+          }
+          return { key, label, value, color };
+        })
+        .filter((bar): bar is VisualGraphBar => Boolean(bar));
+      const statusBreakdown = toObjectArray(graph.status_breakdown)
+        .map((item): VisualGraphBreakdown | null => {
+          const key = asString(item.key);
+          const label = asString(item.label);
+          const count = asNumber(item.count);
+          const color = asString(item.color);
+          if (!key || !label || count === null || !color) {
+            return null;
+          }
+          return { key, label, count, color };
+        })
+        .filter((item): item is VisualGraphBreakdown => Boolean(item));
+      const severityBreakdown = toObjectArray(graph.severity_breakdown)
+        .map((item): VisualGraphBreakdown | null => {
+          const key = asString(item.key);
+          const label = asString(item.label);
+          const count = asNumber(item.count);
+          const color = asString(item.color);
+          if (!key || !label || count === null || !color) {
+            return null;
+          }
+          return { key, label, count, color };
+        })
+        .filter((item): item is VisualGraphBreakdown => Boolean(item));
+      const overlayRaw = toObject(graph.scenario_overlay);
+      const overlay =
+        Object.keys(overlayRaw).length > 0
+          ? {
+              label: asString(overlayRaw.label) ?? "Scenario overlay",
+              risk_delta: asNumber(overlayRaw.risk_delta) ?? 0,
+              valuation_delta: asNumber(overlayRaw.valuation_delta) ?? 0,
+              integration_delta: asNumber(overlayRaw.integration_delta) ?? 0,
+            }
+          : null;
+
+      setAnalysisGraphOutput({
+        title: asString(graph.title) ?? "Risk Landscape",
+        subtitle: asString(graph.subtitle) ?? "",
+        total_weighted_risk: asNumber(graph.total_weighted_risk) ?? 0,
+        open_findings: asNumber(graph.open_findings) ?? 0,
+        requires_approval: asNumber(graph.requires_approval) ?? 0,
+        y_max: asNumber(graph.y_max) ?? 1,
+        bars,
+        status_breakdown: statusBreakdown,
+        severity_breakdown: severityBreakdown,
+        scenario_overlay: overlay,
+      });
+      setAnalysisMessage("Risk graph loaded.");
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Unknown risk graph error.";
+      setAnalysisMessage(`Could not load graph: ${message}`);
+    } finally {
+      setIsLoadingGraph(false);
+    }
+  }
+
+  function clearAnalysisOutputs() {
+    setAnalysisMessage(null);
+    setAnalysisFindings([]);
+    setSelectedFindingId(null);
+    setAnalysisDecisionReason("");
+    setAnalysisScenarioInput("");
+    setAnalysisScenarioOutput(null);
+    setAnalysisGraphOutput(null);
+    setApprovedReport(null);
+  }
+
+  async function generateApprovedFindingsReport(): Promise<void> {
+    const workspaceId = analysisWorkspaceId.trim();
+    if (!workspaceId) {
+      setAnalysisMessage("Workspace ID is required.");
+      return;
+    }
+    setIsGeneratingReport(true);
+    setApprovedReport(null);
+    setAnalysisMessage(null);
+    try {
+      const result = await callTool("generate_approved_findings_report", {
+        workspace_id: workspaceId,
+      });
+      const structured = toObject(result.structuredContent);
+      const report = toObject(structured.report);
+      const pdf = toObject(report.pdf);
+      setApprovedReport({
+        generated_at: asString(report.generated_at) ?? "",
+        approved_count: asNumber(report.approved_count) ?? 0,
+        pending_count: asNumber(report.pending_count) ?? 0,
+        rejected_count: asNumber(report.rejected_count) ?? 0,
+        report_title: asString(report.report_title) ?? "Approved Findings Report",
+        executive_summary: asString(report.executive_summary) ?? "",
+        key_points: toStringArray(report.key_points),
+        approved_findings_digest: toObjectArray(report.approved_findings_digest)
+          .map((item) => ({
+            finding_id: asString(item.finding_id) ?? "",
+            headline: asString(item.headline) ?? "",
+            business_impact: asString(item.business_impact) ?? "",
+            recommended_action: asString(item.recommended_action) ?? "",
+          }))
+          .filter(
+            (item) =>
+              item.finding_id.length > 0 &&
+              item.headline.length > 0 &&
+              item.business_impact.length > 0 &&
+              item.recommended_action.length > 0
+          ),
+        final_recommendation: asString(report.final_recommendation) ?? "",
+        pdf: {
+          file_name: asString(pdf.file_name) ?? "approved-findings-report.pdf",
+          mime_type: asString(pdf.mime_type) ?? "application/pdf",
+          base64: asString(pdf.base64) ?? "",
+        },
+      });
+      setAnalysisMessage("Approved findings report generated.");
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Unknown report generation error.";
+      setAnalysisMessage(`Could not generate report: ${message}`);
+    } finally {
+      setIsGeneratingReport(false);
     }
   }
 }
@@ -1022,6 +1695,19 @@ function asString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function parseFindingStatus(
+  value: unknown
+): "requires_approval" | "approved" | "rejected" {
+  if (value === "approved" || value === "rejected" || value === "requires_approval") {
+    return value;
+  }
+  return "requires_approval";
+}
+
 function toObjectArray(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) {
     return [];
@@ -1030,6 +1716,158 @@ function toObjectArray(value: unknown): Array<Record<string, unknown>> {
     (item): item is Record<string, unknown> =>
       item !== null && typeof item === "object" && !Array.isArray(item)
   );
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function toNumberPair(value: unknown): [number, number] | null {
+  if (!Array.isArray(value) || value.length < 2) {
+    return null;
+  }
+  const first = asNumber(value[0]);
+  const second = asNumber(value[1]);
+  if (first === null || second === null) {
+    return null;
+  }
+  return [first, second];
+}
+
+function renderVisualGraph(
+  graph: VisualGraphPayload,
+  palette: { muted: string; line: string }
+) {
+  if (graph.bars.length === 0) {
+    return (
+      <p style={{ marginTop: 8, color: palette.muted }}>
+        No tower bars available for visualization.
+      </p>
+    );
+  }
+
+  const width = 700;
+  const height = 260;
+  const left = 52;
+  const right = 20;
+  const top = 18;
+  const bottom = 58;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const yMax = Math.max(graph.y_max, 1);
+  const slot = plotWidth / graph.bars.length;
+  const barWidth = Math.max(16, slot - 22);
+
+  return (
+    <div style={{ marginTop: 10 }}>
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        style={{
+          width: "100%",
+          maxWidth: 760,
+          border: `1px solid ${palette.line}`,
+          borderRadius: 8,
+          background: "transparent",
+        }}
+      >
+        <line
+          x1={left}
+          y1={top}
+          x2={left}
+          y2={height - bottom}
+          stroke={palette.line}
+        />
+        <line
+          x1={left}
+          y1={height - bottom}
+          x2={width - right}
+          y2={height - bottom}
+          stroke={palette.line}
+        />
+        {graph.bars.map((bar, index) => {
+          const ratio = Math.max(0, Math.min(1, bar.value / yMax));
+          const barHeight = ratio * plotHeight;
+          const x = left + index * slot + (slot - barWidth) / 2;
+          const y = height - bottom - barHeight;
+          return (
+            <g key={`${bar.key}-${index}`}>
+              <rect
+                x={x}
+                y={y}
+                width={barWidth}
+                height={Math.max(2, barHeight)}
+                fill={bar.color}
+                rx={4}
+              />
+              <text
+                x={x + barWidth / 2}
+                y={y - 6}
+                textAnchor="middle"
+                fontSize="10"
+                fill={palette.muted}
+              >
+                {bar.value.toLocaleString()}
+              </text>
+              <text
+                x={x + barWidth / 2}
+                y={height - bottom + 14}
+                textAnchor="middle"
+                fontSize="10"
+                fill={palette.muted}
+              >
+                {truncateLabel(bar.label, 15)}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+      <p style={{ marginTop: 8, color: palette.muted }}>{graph.subtitle}</p>
+      <div style={{ display: "grid", gap: 6 }}>
+        <div style={{ color: palette.muted, fontSize: 13 }}>
+          Status mix:{" "}
+          {graph.status_breakdown
+            .map((item) => `${item.label} (${item.count})`)
+            .join(" | ")}
+        </div>
+        <div style={{ color: palette.muted, fontSize: 13 }}>
+          Severity mix:{" "}
+          {graph.severity_breakdown
+            .map((item) => `${item.label} (${item.count})`)
+            .join(" | ")}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function truncateLabel(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(1, maxLength - 3))}...`;
+}
+
+function downloadBase64Pdf(base64: string, fileName: string): void {
+  if (!base64 || typeof window === "undefined") {
+    return;
+  }
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: "application/pdf" });
+  const url = window.URL.createObjectURL(blob);
+  const anchor = window.document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName || "approved-findings-report.pdf";
+  window.document.body.appendChild(anchor);
+  anchor.click();
+  window.document.body.removeChild(anchor);
+  window.URL.revokeObjectURL(url);
 }
 
 function Field(props: {
