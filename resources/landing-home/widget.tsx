@@ -1310,6 +1310,10 @@ export default function LandingHomeWidget() {
             file_upload: doc.file_upload,
           })),
       });
+      assertToolCallSucceeded(
+        result,
+        "Intake submission failed. The server returned an error."
+      );
 
       const structured = toObject(result.structuredContent);
       const workspace = toObject(structured.workspace);
@@ -1337,9 +1341,17 @@ export default function LandingHomeWidget() {
         await runOpenAiAnalysisByWorkspaceId(workspaceId);
       }
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Unknown intake submission error.";
-      setSubmitMessage(`Could not submit intake: ${message}`);
+      const message = extractErrorMessage(
+        err,
+        "Unknown intake submission error."
+      );
+      const hasLocalFileUpload = preparedDocuments.some((doc) =>
+        Boolean(doc.file_upload)
+      );
+      const uploadHint = hasLocalFileUpload
+        ? " Local file uploads require a valid Supabase Storage bucket (default `ma-diligence-docs`) and matching service role key."
+        : "";
+      setSubmitMessage(`Could not submit intake: ${message}${uploadHint}`);
     } finally {
       setIsSubmitting(false);
     }
@@ -1382,6 +1394,10 @@ export default function LandingHomeWidget() {
         as_widget: false,
         max_findings_per_document: 5,
       });
+      assertToolCallSucceeded(
+        result,
+        "OpenAI analysis failed. The server returned an error."
+      );
       const structured = toObject(result.structuredContent);
       const findings = toObjectArray(structured.findings)
         .map((item): AnalysisFindingPreview => {
@@ -1415,8 +1431,7 @@ export default function LandingHomeWidget() {
         `AI analysis completed. Total findings: ${findingsTotal}. Click any finding to review and decide.`
       );
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Unknown OpenAI analysis error.";
+      const message = extractErrorMessage(err, "Unknown OpenAI analysis error.");
       setAnalysisMessage(`Could not analyze documents: ${message}`);
     } finally {
       setIsAnalyzingDocuments(false);
@@ -1444,6 +1459,10 @@ export default function LandingHomeWidget() {
             ? analysisDecisionReason
             : undefined,
       });
+      assertToolCallSucceeded(
+        result,
+        "Finding status update failed. The server returned an error."
+      );
       const structured = toObject(result.structuredContent);
       const updatedFinding = toObject(structured.finding);
       const updatedStatus = asString(updatedFinding.status);
@@ -1459,8 +1478,7 @@ export default function LandingHomeWidget() {
       );
       setAnalysisMessage(`Finding ${decision}.`);
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Unknown status update error.";
+      const message = extractErrorMessage(err, "Unknown status update error.");
       setAnalysisMessage(`Could not update finding status: ${message}`);
     } finally {
       setIsUpdatingFindingStatus(false);
@@ -1489,6 +1507,10 @@ export default function LandingHomeWidget() {
         finding_id: selectedAnalysisFinding.finding_id,
         plain_english: analysisScenarioInput,
       });
+      assertToolCallSucceeded(
+        result,
+        "Scenario execution failed. The server returned an error."
+      );
       const structured = toObject(result.structuredContent);
       const comparison = toObject(structured.comparison);
       const recalibrated = toObject(structured.recalibrated_parameters);
@@ -1523,8 +1545,10 @@ export default function LandingHomeWidget() {
       });
       setAnalysisMessage("Scenario run completed.");
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Unknown scenario execution error.";
+      const message = extractErrorMessage(
+        err,
+        "Unknown scenario execution error."
+      );
       setAnalysisMessage(`Could not run scenario: ${message}`);
     } finally {
       setIsRunningScenario(false);
@@ -1546,6 +1570,10 @@ export default function LandingHomeWidget() {
         finding_id: selectedAnalysisFinding?.finding_id,
         scenario_parameters: analysisScenarioOutput?.recalibrated_parameters,
       });
+      assertToolCallSucceeded(
+        result,
+        "Risk graph load failed. The server returned an error."
+      );
       const structured = toObject(result.structuredContent);
       const graph = toObject(structured.graph);
       const bars = toObjectArray(graph.bars)
@@ -1609,8 +1637,7 @@ export default function LandingHomeWidget() {
       });
       setAnalysisMessage("Risk graph loaded.");
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Unknown risk graph error.";
+      const message = extractErrorMessage(err, "Unknown risk graph error.");
       setAnalysisMessage(`Could not load graph: ${message}`);
     } finally {
       setIsLoadingGraph(false);
@@ -1641,6 +1668,10 @@ export default function LandingHomeWidget() {
       const result = await callTool("generate_approved_findings_report", {
         workspace_id: workspaceId,
       });
+      assertToolCallSucceeded(
+        result,
+        "Report generation failed. The server returned an error."
+      );
       const structured = toObject(result.structuredContent);
       const report = toObject(structured.report);
       const pdf = toObject(report.pdf);
@@ -1675,8 +1706,10 @@ export default function LandingHomeWidget() {
       });
       setAnalysisMessage("Approved findings report generated.");
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Unknown report generation error.";
+      const message = extractErrorMessage(
+        err,
+        "Unknown report generation error."
+      );
       setAnalysisMessage(`Could not generate report: ${message}`);
     } finally {
       setIsGeneratingReport(false);
@@ -1697,6 +1730,83 @@ function asString(value: unknown): string | null {
 
 function asNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function extractErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim().length > 0) {
+    return error;
+  }
+
+  const obj = toObject(error);
+  const direct =
+    asString(obj.message) ??
+    asString(obj.error) ??
+    asString(obj.detail) ??
+    asString(obj.title);
+  if (direct && direct.trim().length > 0) {
+    return direct;
+  }
+
+  const nestedError = toObject(obj.error);
+  const nested =
+    asString(nestedError.message) ??
+    asString(nestedError.detail) ??
+    asString(nestedError.title);
+  if (nested && nested.trim().length > 0) {
+    return nested;
+  }
+
+  try {
+    const serialized = JSON.stringify(error);
+    if (serialized && serialized !== "{}") {
+      return serialized;
+    }
+  } catch {
+    // Ignore JSON serialization errors and fall back.
+  }
+
+  return fallback;
+}
+
+function extractToolErrorMessage(response: unknown): string | null {
+  const normalized = toObject(response);
+  const resultText = asString(normalized.result);
+  if (resultText && resultText.trim().length > 0) {
+    return resultText;
+  }
+
+  const content = toObjectArray(normalized.content);
+  const textMessages = content
+    .filter((block) => asString(block.type) === "text")
+    .map((block) => asString(block.text))
+    .filter((text): text is string => Boolean(text && text.trim().length > 0));
+  if (textMessages.length > 0) {
+    return textMessages.join("\n");
+  }
+
+  const structured = toObject(normalized.structuredContent);
+  const structuredMessage =
+    asString(structured.message) ??
+    asString(structured.error) ??
+    asString(structured.detail);
+  if (structuredMessage && structuredMessage.trim().length > 0) {
+    return structuredMessage;
+  }
+
+  return null;
+}
+
+function assertToolCallSucceeded(response: unknown, fallback: string): void {
+  const normalized = toObject(response);
+  if (normalized.isError !== true) {
+    return;
+  }
+
+  const message = extractToolErrorMessage(response) ?? fallback;
+  throw new Error(message);
 }
 
 function parseFindingStatus(
