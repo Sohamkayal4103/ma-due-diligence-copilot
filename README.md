@@ -1,6 +1,6 @@
 # Full-Spectrum M&A Due-Diligence Copilot
 
-An AI-native M&A diligence operating system built with `mcp-use`, designed for enterprise deal teams, legal counsel, finance, and integration leadership.
+An AI-native __Mergers and Acquisitions__ diligence operating system built with `mcp-use`, designed for enterprise deal teams, legal counsel, finance, and integration leadership.
 
 This project turns merger and acquisition diligence from a document-heavy, high-billing-hour workflow into a governed, evidence-first, continuously re-scored intelligence loop.
 
