@@ -8,6 +8,7 @@ const findingSchema = z.object({
   document_name: z.string(),
   title: z.string(),
   summary: z.string(),
+  management_points: z.array(z.string()).default([]),
   tower: z.string(),
   severity: z.string(),
   status: z.enum(["requires_approval", "approved", "rejected"]),
@@ -186,6 +187,13 @@ export default function AiFindingsWidget() {
           <h3 style={{ margin: "0 0 6px 0" }}>Selected Finding</h3>
           <div style={{ fontWeight: 700 }}>{selectedFinding.title}</div>
           <p style={{ marginTop: 6, color: palette.muted }}>{selectedFinding.summary}</p>
+          {selectedFinding.management_points.length > 0 ? (
+            <ul style={{ marginTop: 6, color: palette.muted }}>
+              {selectedFinding.management_points.map((point) => (
+                <li key={point}>{point}</li>
+              ))}
+            </ul>
+          ) : null}
           <p style={{ marginTop: 0, color: palette.muted, fontSize: 13 }}>
             ID: {selectedFinding.finding_id} | Document:{" "}
             {selectedFinding.document_name} | Tower: {selectedFinding.tower}

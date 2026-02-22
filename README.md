@@ -1,77 +1,120 @@
-# Full-Spectrum M&A Due-Diligence Copilot (MCP Server + Widgets)
+# Full-Spectrum M&A Due-Diligence Copilot
 
-Federated, provenance-first due-diligence orchestration server built with `mcp-use` for M&A workflows.
+An AI-native M&A diligence operating system built with `mcp-use`, designed for enterprise deal teams, legal counsel, finance, and integration leadership.
 
-This project models a full deal workflow across financial, legal, commercial, operations, HR, tax, and technical/cyber towers with governance gates, scenario modeling, and IC package generation.
+This project turns merger and acquisition diligence from a document-heavy, high-billing-hour workflow into a governed, evidence-first, continuously re-scored intelligence loop.
 
-## What This Project Includes
+## Demo Video
 
-- Central orchestrator MCP server (`index.ts`, `src/orchestrator.ts`)
-- Federated source ingestion and checksum dedupe
-- Canonical entity linking from claims/document text
-- Risk signal detection and contradiction detection
-- Policy-gated approval workflow for high-impact findings
-- Provenance chains for every finding
-- Scenario simulation (downside/base/upside/custom)
-- Management-ready report generation (IC packages)
-- Hash-chained audit ledger
-- MCP widget UI (`resources/risk-map/widget.tsx`) for cockpit-style interaction in MCP clients/Inspector
+[![Watch the demo](https://img.youtube.com/vi/m1wQrF-cueQ/hqdefault.jpg)](https://youtu.be/m1wQrF-cueQ)
 
-## Architecture Mapping
+## Why This Is A Big Deal
 
-- `src/orchestrator.ts`: workflow orchestration, tool-facing application layer
-- `src/core/event-bus.ts`: in-memory event stream
-- `src/core/tower-registry.ts`: federated source definitions + required scopes
-- `src/services/workspace-service.ts`: workspace lifecycle + participant access boundaries
-- `src/services/evidence-ingestion-service.ts`: artifact ingest + dedupe
-- `src/services/canonical-model-service.ts`: claim/doc normalization + entity linking
-- `src/services/contradiction-detector-service.ts`: cross-source inconsistency detection
-- `src/services/finding-service.ts`: finding lifecycle + dedupe merge behavior
-- `src/services/risk-scoring-service.ts`: rule-based signal detection + risk graph computation
-- `src/services/scenario-service.ts`: valuation/integration/risk deltas
-- `src/services/provenance-service.ts`: finding-to-evidence lineage
-- `src/services/approval-service.ts`: approval request + decision model
-- `src/services/audit-ledger-service.ts`: immutable-style hash chain
-- `src/services/gap-request-service.ts`: missing-evidence elicitation tickets
-- `src/services/reporting-service.ts`: IC package compilation
+M&A is a high-stakes, multi-billion-dollar process where legal and advisory workstreams can dominate deal cost and timeline. In many markets, lawyer and specialist review time commonly runs in the `$100-$200+ / hour` range (and often much higher for senior counsel).
+
+This copilot is built to:
+- Replace large portions of repetitive legal/analyst diligence work.
+- Reduce avoidable human review errors across thousands of pages.
+- Compress billing-heavy hours spent on triage, contradiction checks, and memo drafting.
+- Keep lawyers in control for judgment calls and approvals.
+
+The target outcome is not "no lawyers."  
+The target outcome is **fewer low-value hours, faster decisions, and better risk visibility**.
+
+## What It Does
+
+- Creates isolated merger/acquisition workspaces
+- Ingests documents from federated sources and Supabase
+- Runs OpenAI-based full-document analysis
+- Detects contradictions and high-impact risks
+- Forces human approval gates for sensitive findings
+- Converts plain-English legal scenarios into quantified stress tests
+- Generates visual risk graphs and executive report PDFs
+- Produces provenance-backed IC decision packages
+
+## The 6 Boardroom Scenarios (Core Demo Scoring Criteria)
+
+This demo should be judged on how well the product handles these six scenarios end-to-end:
+
+1. **Governance Control Reset**
+- Detects post-acquisition governance changes (board composition, equal rights, voting shifts).
+- Flags control-risk before Day 1.
+
+2. **Talent Flight & Contract Shock**
+- Detects compensation/term changes in employee agreements post-acquisition.
+- Flags missing retention mechanisms and potential poaching exposure.
+
+3. **Declining Sector Revenue Trap**
+- Reads sales CSVs and identifies sectors with sustained decline.
+- Quantifies potential infeasibility and downside risk.
+
+4. **Contractual Fragility Under Change-of-Control**
+- Surfaces clauses that can trigger renegotiation/termination at closing.
+- Prioritizes legal red flags by impact and confidence.
+
+5. **Contradiction Detection Across Sources**
+- Compares legal/finance/data-room claims and highlights mismatches.
+- Forces evidence-backed reconciliation before committee sign-off.
+
+6. **Decision Pressure Simulation**
+- Converts plain-English scenario inputs into model parameters.
+- Runs valuation/risk stress tests and returns executive-ready interpretation.
+
+## Product Highlights
+
+- **Provenance-first by design:** every finding links back to evidence.
+- **Human-in-the-loop governance:** approve/reject gates for high-impact findings.
+- **Executive readability:** concise bullet-point findings and report output.
+- **Visual risk intelligence:** graph view + scenario overlays.
+- **Approved-only board report:** one-click PDF generation for decision meetings.
+
+## Technical Architecture (High Level)
+
+- `src/orchestrator.ts`: application orchestration layer
+- `src/services/*`: workspace, ingestion, contradictions, risk, scenario, approval, reporting, audit
+- `index.ts`: MCP server and tool contracts
+- `resources/landing-home/widget.tsx`: main product UI (deal intake, findings review, graph/report actions)
+- `resources/ai-findings/widget.tsx`: focused findings interaction widget
 - `resources/risk-map/widget.tsx`: risk cockpit widget
 
 ## MCP Tools
 
-Core diligence tools:
+Core workflow:
 - `show_landing_home`
 - `create_workspace`
 - `submit_deal_intake`
 - `ingest_evidence_batch`
 - `list_findings`
 - `recompute_risk_graph`
+- `generate_visual_risk_graph`
 - `run_scenarios`
 - `analyze_documents_with_openai`
+- `set_ai_finding_status`
+- `run_ai_finding_plaintext_scenario`
 - `request_missing_evidence`
 - `approve_finding`
+- `generate_approved_findings_report`
 - `generate_ic_package`
 - `get_provenance_chain`
 - `list_workspace_events`
 - `list_audit_ledger`
 
-Demo/workflow helper tools:
+Demo helpers:
 - `ingest_demo_source`
 - `bootstrap_demo_flow`
 
-Scenario authoring tools:
+Scenario authoring:
 - `generate_finding_scenarios_plain_english`
 - `convert_plain_english_to_scenario_params`
 - `run_finding_scenario_story`
 
-## Security and Governance Behaviors
+## Security and Governance
 
 - Tenant-aware access checks and workspace isolation
-- Scope-based authorization per source and operation
-- Role gating for reviewer-only approval actions
-- Automatic approval gate for `high`/`critical` or material findings
-- Provenance requirement before non-red-flag IC package generation
-- Policy block when unresolved required approvals exist
-- Hash-linked audit ledger entries for workflow traceability
+- Role and scope enforcement on sensitive actions
+- Mandatory approval gating for high-impact findings
+- Provenance requirements for decision-ready outputs
+- Hash-linked immutable-style audit trail
 
 ## Quick Start
 
@@ -81,33 +124,31 @@ pnpm install
 pnpm dev
 ```
 
-By default, opening `http://localhost:3000` redirects to the landing widget page.
+Open:
+- `http://localhost:3000` (landing widget)
+- `http://localhost:3000/mcp` (MCP endpoint)
 
-After server starts, open MCP Inspector and run:
-1. `show_landing_home`
-2. Use landing widget buttons (`Create New Merger` / `Create New Acquisition`) and submit the intake form
-3. `bootstrap_demo_flow`
-4. `list_findings` (set `as_widget: true` to render risk-map)
-5. `approve_finding` for findings in `requires_approval`
-6. `run_scenarios` or `run_finding_scenario_story`
-7. `analyze_documents_with_openai` (renders AI findings widget with finding IDs + document names)
-8. `generate_ic_package`
-9. `list_audit_ledger`
+## Suggested Demo Run
 
-## Demo Actors
+1. Open landing page and create a new merger/acquisition intake.
+2. Upload:
+- governance/company structure PDF
+- employee contract PDF
+- sales CSV
+3. Click `Submit Intake + Analyze Documents`.
+4. Review findings and approve selected risks.
+5. Run plain-English scenarios from legal perspective.
+6. View visual graph.
+7. Generate approved-only executive PDF report.
+8. Generate IC package.
 
-Defined in `src/orchestrator.ts`:
-- `DEMO_ACTOR`: analyst permissions for ingestion/analysis/reporting
-- `REVIEWER_ACTOR`: reviewer permissions including `finding:approve`
+## Current Scope and Notes
 
-## Current Scope and Production Notes
-
-- Current storage is in-memory (process-local)
-- Current risk extraction is rule-based (keywords + claim contradiction rules)
-- Optional OpenAI document analysis is available via `analyze_documents_with_openai` (requires `OPENAI_API_KEY`)
-- Supabase persistence is available via `submit_deal_intake` when configured
-- See `SUPABASE_SETUP.md` for table schema and portal setup steps
+- Runtime storage is in-memory for orchestration state
+- Supabase persistence is supported for deal/doc intake
+- OpenAI analysis requires `OPENAI_API_KEY`
+- See `SUPABASE_SETUP.md` for table and storage setup
 
 ## Suggested GitHub Repo Description
 
-`Full-spectrum M&A due-diligence copilot using MCP: federated evidence ingestion, risk/contradiction detection, approval governance, scenario modeling, provenance, and IC package generation.`
+`AI-native M&A due-diligence copilot: federated evidence ingestion, legal/financial risk detection, contradiction intelligence, approval governance, scenario simulation, visual risk analytics, and executive-ready IC reporting.`
