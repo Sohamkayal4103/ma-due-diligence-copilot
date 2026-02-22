@@ -4,9 +4,13 @@ An AI-native __Mergers and Acquisitions__ diligence operating system built with 
 
 This project turns merger and acquisition diligence from a document-heavy, high-billing-hour workflow into a governed, evidence-first, continuously re-scored intelligence loop.
 
+## MCP Server link
+[MCP Server Link](https://sweet-sunset-f30mi.run.mcp-use.com/mcp)
+
 ## Demo Video
 
 [![Watch the demo](https://img.youtube.com/vi/m1wQrF-cueQ/hqdefault.jpg)](https://youtu.be/m1wQrF-cueQ)
+
 
 ## Why This Is A Big Deal
 
