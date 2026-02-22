@@ -1,4 +1,6 @@
 import { MCPServer, object, widget } from "mcp-use/server";
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import {
   buildDefaultScenarioSet,
@@ -16,6 +18,7 @@ const server = new MCPServer({
     "Full-spectrum federated M&A due-diligence orchestration server with provenance-first risk intelligence.",
   baseUrl: process.env.MCP_URL || "http://localhost:3000",
 });
+const LANDING_WIDGET_PATH = "/mcp-use/widgets/landing-home/index.html";
 
 const orchestrator = new DueDiligenceOrchestrator();
 const demoWorkspace = orchestrator.seedDemoWorkspace();
@@ -38,6 +41,45 @@ const scenarioSchema = z.object({
   assumptions: z.record(z.string(), z.number()),
 });
 
+const dealTypeSchema = z.enum(["merger", "acquisition"]);
+const diligenceTowerSchema = z.enum([
+  "financial",
+  "legal_regulatory",
+  "commercial_market",
+  "operations_supply_chain",
+  "people_hr",
+  "tax_jurisdiction",
+  "technical_cyber",
+]);
+const riskSeveritySchema = z.enum(["low", "medium", "high", "critical"]);
+const intakeFileUploadSchema = z.object({
+  file_name: z.string().min(1),
+  mime_type: z.string().min(1),
+  size_bytes: z.number().int().nonnegative(),
+  base64: z.string().min(1),
+});
+
+const intakeDocumentSchema = z
+  .object({
+    document_name: z.string().min(2),
+    document_type: z.string().min(2),
+    source_uri: z.string().optional(),
+    mime_type: z.string().optional(),
+    notes: z.string().optional(),
+    raw_text: z.string().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    file_upload: intakeFileUploadSchema.optional(),
+  })
+  .superRefine((doc, ctx) => {
+    if (!doc.source_uri && !doc.file_upload) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["source_uri"],
+        message: "Provide either source_uri or file_upload for each document.",
+      });
+    }
+  });
+
 orchestrator.events.subscribeAll(async (event) => {
   try {
     await server.sendNotification("notifications/ma/event", event as any);
@@ -48,6 +90,114 @@ orchestrator.events.subscribeAll(async (event) => {
 
 server.app.get("/health", (c) => c.json({ status: "ok", service: "ma-dd" }));
 server.app.get("/workspace/demo", (c) => c.json(demoWorkspace));
+server.app.get("/", (c) => c.redirect(LANDING_WIDGET_PATH));
+
+server.tool(
+  {
+    name: "show_landing_home",
+    description:
+      "Render the product landing widget that explains what the app does and the standard M&A workflow.",
+    schema: z.object({
+      focus: z
+        .enum(["overview", "workflow", "agent_role"])
+        .default("overview"),
+    }),
+    widget: {
+      name: "landing-home",
+      invoking: "Loading product landing...",
+      invoked: "Landing loaded",
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ focus }) => {
+    return widget({
+      props: { focus },
+      message:
+        "Loaded landing page widget with overview + workflow + AI agent role.",
+    });
+  }
+);
+
+server.tool(
+  {
+    name: "submit_deal_intake",
+    description:
+      "Create a merger/acquisition workspace and persist deal + document intake records into Supabase.",
+    schema: z.object({
+      tenant_id: z.string().default("tenant-demo"),
+      deal_type: dealTypeSchema,
+      deal_name: z.string().min(3),
+      acquirer_name: z.string().min(2),
+      target_name: z.string().min(2),
+      thesis: z.string().min(8),
+      deal_value: z.number().nonnegative().optional(),
+      currency: z.string().default("USD"),
+      expected_close_date: z.string().optional(),
+      jurisdiction: z.string().optional(),
+      industry: z.string().optional(),
+      owner_email: z.string().email().optional(),
+      materiality_threshold: z.number().positive().default(4_500_000),
+      policy_profile: z.string().default("strict-default"),
+      documents: z.array(intakeDocumentSchema).default([]),
+      actor: actorSchema.optional(),
+    }),
+    annotations: { readOnlyHint: false, openWorldHint: false },
+  },
+  async ({
+    tenant_id,
+    deal_type,
+    deal_name,
+    acquirer_name,
+    target_name,
+    thesis,
+    deal_value,
+    currency,
+    expected_close_date,
+    jurisdiction,
+    industry,
+    owner_email,
+    materiality_threshold,
+    policy_profile,
+    documents,
+    actor,
+  }) => {
+    const resolvedActor = actor ?? DEMO_ACTOR;
+    const workspace = orchestrator.createWorkspace(
+      {
+        tenant_id,
+        deal_name,
+        thesis,
+        materiality_threshold,
+        policy_profile,
+      },
+      resolvedActor
+    );
+
+    const persistence = await persistDealIntakeToSupabase({
+      workspace_id: workspace.workspace_id,
+      tenant_id,
+      deal_type,
+      deal_name,
+      acquirer_name,
+      target_name,
+      thesis,
+      deal_value,
+      currency,
+      expected_close_date,
+      jurisdiction,
+      industry,
+      owner_email,
+      materiality_threshold,
+      policy_profile,
+      documents,
+    });
+
+    return object({
+      workspace,
+      persistence,
+    });
+  }
+);
 
 server.tool(
   {
@@ -449,6 +599,113 @@ server.tool(
 
 server.tool(
   {
+    name: "analyze_documents_with_openai",
+    description:
+      "Analyze full workspace documents using OpenAI and return AI findings with finding IDs and source document names.",
+    schema: z.object({
+      workspace_id: z.string(),
+      as_widget: z.boolean().default(true),
+      model: z.string().default("gpt-4.1"),
+      max_findings_per_document: z.number().int().min(1).max(12).default(5),
+      actor: actorSchema.optional(),
+    }),
+    widget: {
+      name: "ai-findings",
+      invoking: "Running OpenAI document analysis...",
+      invoked: "AI findings ready",
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({
+    workspace_id,
+    as_widget,
+    model,
+    max_findings_per_document,
+    actor,
+  }) => {
+    const resolvedActor = actor ?? DEMO_ACTOR;
+
+    // Access check against workspace RBAC before contacting external APIs.
+    orchestrator.listFindings({
+      workspace_id,
+      filters: {},
+      actor: resolvedActor,
+    });
+
+    const openaiApiKey = process.env.OPENAI_API_KEY;
+    if (!openaiApiKey || openaiApiKey.trim().length === 0) {
+      throw new Error(
+        "OPENAI_API_KEY is not configured. Add it to .env/.env.local and restart."
+      );
+    }
+
+    const documents = await loadWorkspaceDocumentsFromSupabase(workspace_id);
+    if (documents.length === 0) {
+      throw new Error(
+        `No documents found in Supabase for workspace '${workspace_id}'. Submit intake documents first.`
+      );
+    }
+
+    const findings: OpenAiWidgetFinding[] = [];
+    const analyzedDocuments: OpenAiWidgetDocument[] = [];
+    for (const doc of documents) {
+      const source = await resolveDocumentContentForOpenAi(doc);
+      const aiResult = await analyzeDocumentWithOpenAi({
+        workspace_id,
+        document: doc,
+        source,
+        api_key: openaiApiKey,
+        model,
+        max_findings_per_document,
+      });
+
+      analyzedDocuments.push({
+        document_id: doc.document_id,
+        document_name: doc.document_name,
+        source_type: source.type,
+        source_label: source.source_label,
+        bytes_sent: source.type === "file_bytes" ? source.size_bytes : undefined,
+        chars_sent: source.type === "raw_text" ? source.text.length : undefined,
+        summary: aiResult.document_summary,
+      });
+
+      for (const item of aiResult.findings) {
+        findings.push({
+          finding_id: randomUUID(),
+          document_id: doc.document_id,
+          document_name: doc.document_name,
+          title: item.title,
+          summary: item.summary,
+          tower: item.tower,
+          severity: item.severity,
+          probability: clamp01(item.probability),
+          confidence: clamp01(item.confidence),
+          impact_value: Math.max(0, Math.round(item.impact_value)),
+        });
+      }
+    }
+
+    const payload = {
+      workspace_id,
+      model,
+      analyzed_documents: analyzedDocuments,
+      findings_total: findings.length,
+      findings,
+    };
+
+    if (as_widget) {
+      return widget({
+        props: payload,
+        message: `Analyzed ${analyzedDocuments.length} document(s) and generated ${findings.length} finding(s).`,
+      });
+    }
+
+    return object(payload);
+  }
+);
+
+server.tool(
+  {
     name: "request_missing_evidence",
     description:
       "Open adaptive diligence elicitation requests for unresolved high-impact evidence gaps.",
@@ -652,6 +909,742 @@ function textBanner(): string {
     "5) generate_ic_package",
     "",
   ].join("\n");
+}
+
+interface DealIntakeDocumentInput {
+  document_name: string;
+  document_type: string;
+  source_uri?: string;
+  mime_type?: string;
+  notes?: string;
+  raw_text?: string;
+  metadata?: Record<string, unknown>;
+  file_upload?: {
+    file_name: string;
+    mime_type: string;
+    size_bytes: number;
+    base64: string;
+  };
+}
+
+interface DealIntakePersistenceInput {
+  workspace_id: string;
+  tenant_id: string;
+  deal_type: "merger" | "acquisition";
+  deal_name: string;
+  acquirer_name: string;
+  target_name: string;
+  thesis: string;
+  deal_value?: number;
+  currency: string;
+  expected_close_date?: string;
+  jurisdiction?: string;
+  industry?: string;
+  owner_email?: string;
+  materiality_threshold: number;
+  policy_profile: string;
+  documents: DealIntakeDocumentInput[];
+}
+
+async function persistDealIntakeToSupabase(
+  input: DealIntakePersistenceInput
+): Promise<{
+  provider: "supabase";
+  deal_table: string;
+  document_table: string;
+  document_bucket: string;
+  inserted_deal_id: string;
+  inserted_documents: number;
+  uploaded_files: number;
+}> {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error(
+      "Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env.local."
+    );
+  }
+
+  const dealTable = process.env.SUPABASE_DEAL_TABLE ?? "ma_deals";
+  const documentTable = process.env.SUPABASE_DOCUMENT_TABLE ?? "ma_deal_documents";
+  const documentBucket = process.env.SUPABASE_DOCUMENT_BUCKET ?? "ma-diligence-docs";
+  const baseUrl = supabaseUrl.replace(/\/+$/, "");
+
+  const headers: Record<string, string> = {
+    apikey: serviceRoleKey,
+    Authorization: `Bearer ${serviceRoleKey}`,
+    "Content-Type": "application/json",
+    Prefer: "return=representation",
+  };
+
+  const dealPayload = {
+    workspace_id: input.workspace_id,
+    tenant_id: input.tenant_id,
+    deal_type: input.deal_type,
+    deal_name: input.deal_name,
+    acquirer_name: input.acquirer_name,
+    target_name: input.target_name,
+    thesis: input.thesis,
+    deal_value: input.deal_value ?? null,
+    currency: input.currency,
+    expected_close_date: input.expected_close_date ?? null,
+    jurisdiction: input.jurisdiction ?? null,
+    industry: input.industry ?? null,
+    owner_email: input.owner_email ?? null,
+    materiality_threshold: input.materiality_threshold,
+    policy_profile: input.policy_profile,
+    metadata: {
+      source: "submit_deal_intake",
+      submitted_at: new Date().toISOString(),
+    },
+  };
+
+  const dealRes = await fetch(`${baseUrl}/rest/v1/${dealTable}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify([dealPayload]),
+  });
+
+  if (!dealRes.ok) {
+    const body = await dealRes.text();
+    throw new Error(`Supabase deal insert failed (${dealRes.status}): ${body}`);
+  }
+
+  const insertedDeal = toArray(await dealRes.json())[0];
+  const insertedDealId =
+    typeof insertedDeal?.deal_id === "string"
+      ? insertedDeal.deal_id
+      : typeof insertedDeal?.id === "string"
+        ? insertedDeal.id
+        : null;
+
+  if (!insertedDealId) {
+    throw new Error(
+      "Supabase deal insert response did not include deal_id (or id). Check table schema and PostgREST response."
+    );
+  }
+
+  let insertedDocuments = 0;
+  let uploadedFiles = 0;
+  if (input.documents.length > 0) {
+    const docsPayload: Array<Record<string, unknown>> = [];
+    for (const [index, doc] of input.documents.entries()) {
+      let sourceUri = doc.source_uri ?? null;
+      let mimeType = doc.mime_type ?? null;
+      const metadata: Record<string, unknown> = { ...(doc.metadata ?? {}) };
+
+      if (doc.file_upload) {
+        const now = new Date().toISOString();
+        const storagePath = buildStoragePath({
+          tenant_id: input.tenant_id,
+          workspace_id: input.workspace_id,
+          deal_id: insertedDealId,
+          index,
+          file_name: doc.file_upload.file_name,
+        });
+
+        await uploadFileToSupabaseStorage({
+          base_url: baseUrl,
+          service_role_key: serviceRoleKey,
+          bucket: documentBucket,
+          path: storagePath,
+          mime_type: doc.file_upload.mime_type || "application/octet-stream",
+          base64: doc.file_upload.base64,
+        });
+
+        uploadedFiles += 1;
+        mimeType = mimeType ?? doc.file_upload.mime_type;
+        if (!sourceUri) {
+          sourceUri = `supabase://${documentBucket}/${storagePath}`;
+        }
+
+        metadata.storage = {
+          bucket: documentBucket,
+          path: storagePath,
+          file_name: doc.file_upload.file_name,
+          mime_type: doc.file_upload.mime_type,
+          size_bytes: doc.file_upload.size_bytes,
+          uploaded_at: now,
+        };
+      }
+
+      docsPayload.push({
+        deal_id: insertedDealId,
+        workspace_id: input.workspace_id,
+        document_name: doc.document_name,
+        document_type: doc.document_type,
+        source_uri: sourceUri,
+        mime_type: mimeType,
+        notes: doc.notes ?? null,
+        raw_text: doc.raw_text ?? null,
+        metadata,
+      });
+    }
+
+    const docsRes = await fetch(`${baseUrl}/rest/v1/${documentTable}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(docsPayload),
+    });
+
+    if (!docsRes.ok) {
+      const body = await docsRes.text();
+      throw new Error(
+        `Supabase document insert failed (${docsRes.status}): ${body}`
+      );
+    }
+
+    insertedDocuments = docsPayload.length;
+  }
+
+  return {
+    provider: "supabase",
+    deal_table: dealTable,
+    document_table: documentTable,
+    document_bucket: documentBucket,
+    inserted_deal_id: insertedDealId,
+    inserted_documents: insertedDocuments,
+    uploaded_files: uploadedFiles,
+  };
+}
+
+function toArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (item): item is Record<string, unknown> =>
+      item !== null && typeof item === "object" && !Array.isArray(item)
+  );
+}
+
+function buildStoragePath(args: {
+  tenant_id: string;
+  workspace_id: string;
+  deal_id: string;
+  index: number;
+  file_name: string;
+}): string {
+  const sanitizedName = sanitizeFileName(args.file_name);
+  const stamp = Date.now();
+  return [
+    args.tenant_id,
+    args.workspace_id,
+    args.deal_id,
+    `${args.index + 1}-${stamp}-${sanitizedName}`,
+  ].join("/");
+}
+
+function sanitizeFileName(fileName: string): string {
+  return fileName
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(0, 120);
+}
+
+async function uploadFileToSupabaseStorage(args: {
+  base_url: string;
+  service_role_key: string;
+  bucket: string;
+  path: string;
+  mime_type: string;
+  base64: string;
+}) {
+  const encodedPath = args.path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const url = `${args.base_url}/storage/v1/object/${encodeURIComponent(args.bucket)}/${encodedPath}`;
+  const binary = Buffer.from(args.base64, "base64");
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: args.service_role_key,
+      Authorization: `Bearer ${args.service_role_key}`,
+      "Content-Type": args.mime_type || "application/octet-stream",
+      "x-upsert": "true",
+    },
+    body: binary,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Supabase storage upload failed (${res.status}): ${body}`);
+  }
+}
+
+interface SupabaseDocumentRow {
+  document_id: string;
+  deal_id: string;
+  workspace_id: string;
+  document_name: string;
+  document_type: string;
+  source_uri: string | null;
+  mime_type: string | null;
+  notes: string | null;
+  raw_text: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+type OpenAiDocumentSource =
+  | {
+      type: "file_bytes";
+      source_label: string;
+      file_name: string;
+      mime_type: string;
+      base64: string;
+      size_bytes: number;
+    }
+  | {
+      type: "raw_text";
+      source_label: string;
+      text: string;
+    };
+
+const openAiFindingSchema = z.object({
+  title: z.string().min(3),
+  summary: z.string().min(8),
+  severity: riskSeveritySchema,
+  tower: diligenceTowerSchema,
+  probability: z.number(),
+  impact_value: z.number(),
+  confidence: z.number(),
+});
+
+const openAiDocumentAnalysisSchema = z.object({
+  document_summary: z.string().default(""),
+  findings: z.array(openAiFindingSchema).default([]),
+});
+
+interface OpenAiWidgetFinding {
+  finding_id: string;
+  document_id: string;
+  document_name: string;
+  title: string;
+  summary: string;
+  tower: z.infer<typeof diligenceTowerSchema>;
+  severity: z.infer<typeof riskSeveritySchema>;
+  probability: number;
+  confidence: number;
+  impact_value: number;
+}
+
+interface OpenAiWidgetDocument {
+  document_id: string;
+  document_name: string;
+  source_type: "file_bytes" | "raw_text";
+  source_label: string;
+  bytes_sent?: number;
+  chars_sent?: number;
+  summary: string;
+}
+
+async function loadWorkspaceDocumentsFromSupabase(
+  workspaceId: string
+): Promise<SupabaseDocumentRow[]> {
+  const { base_url, service_role_key, document_table } =
+    getSupabaseConfigOrThrow();
+
+  const query = new URLSearchParams({
+    workspace_id: `eq.${workspaceId}`,
+    select:
+      "document_id,deal_id,workspace_id,document_name,document_type,source_uri,mime_type,notes,raw_text,metadata,created_at",
+    order: "created_at.asc",
+  });
+  const url = `${base_url}/rest/v1/${document_table}?${query.toString()}`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      apikey: service_role_key,
+      Authorization: `Bearer ${service_role_key}`,
+      "Content-Type": "application/json",
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(
+      `Supabase document query failed (${res.status}) for workspace '${workspaceId}': ${body}`
+    );
+  }
+
+  const rows = toArray(await res.json());
+  return rows
+    .map((row) => ({
+      document_id: asRequiredString(row.document_id, "document_id"),
+      deal_id: asRequiredString(row.deal_id, "deal_id"),
+      workspace_id: asRequiredString(row.workspace_id, "workspace_id"),
+      document_name: asRequiredString(row.document_name, "document_name"),
+      document_type: asRequiredString(row.document_type, "document_type"),
+      source_uri: asOptionalString(row.source_uri),
+      mime_type: asOptionalString(row.mime_type),
+      notes: asOptionalString(row.notes),
+      raw_text: asOptionalString(row.raw_text),
+      metadata: toRecord(row.metadata),
+      created_at: asOptionalString(row.created_at) ?? new Date().toISOString(),
+    }))
+    .filter((doc) => doc.workspace_id === workspaceId);
+}
+
+async function resolveDocumentContentForOpenAi(
+  doc: SupabaseDocumentRow
+): Promise<OpenAiDocumentSource> {
+  // Prefer storage/file-backed sources to preserve full binary document contents.
+  const storageMeta = toRecord(toRecord(doc.metadata).storage);
+  const storageBucket = asOptionalString(storageMeta.bucket);
+  const storagePath = asOptionalString(storageMeta.path);
+  if (storageBucket && storagePath) {
+    const bytes = await downloadSupabaseStorageObject(storageBucket, storagePath);
+    return buildBinarySource({
+      source_label: `supabase://${storageBucket}/${storagePath}`,
+      file_name:
+        asOptionalString(storageMeta.file_name) ?? `${doc.document_name}.bin`,
+      mime_type:
+        asOptionalString(storageMeta.mime_type) ??
+        doc.mime_type ??
+        "application/octet-stream",
+      bytes,
+    });
+  }
+
+  if (doc.source_uri?.startsWith("supabase://")) {
+    const parsed = parseSupabaseUri(doc.source_uri);
+    if (parsed) {
+      const bytes = await downloadSupabaseStorageObject(
+        parsed.bucket,
+        parsed.path
+      );
+      return buildBinarySource({
+        source_label: doc.source_uri,
+        file_name: inferFileName(doc, parsed.path),
+        mime_type: doc.mime_type ?? "application/octet-stream",
+        bytes,
+      });
+    }
+  }
+
+  if (doc.source_uri?.startsWith("file://")) {
+    const localPath = decodeURIComponent(doc.source_uri.replace(/^file:\/\//, ""));
+    const bytes = await readFile(localPath);
+    return buildBinarySource({
+      source_label: doc.source_uri,
+      file_name: inferFileName(doc, localPath),
+      mime_type: doc.mime_type ?? "application/octet-stream",
+      bytes,
+    });
+  }
+
+  if (doc.raw_text && doc.raw_text.trim().length > 0) {
+    return {
+      type: "raw_text",
+      source_label: doc.source_uri ?? "raw_text",
+      text: doc.raw_text,
+    };
+  }
+
+  throw new Error(
+    `Document '${doc.document_name}' has no readable source. Provide file upload/storage path or raw_text.`
+  );
+}
+
+function buildBinarySource(args: {
+  source_label: string;
+  file_name: string;
+  mime_type: string;
+  bytes: Buffer | Uint8Array;
+}): OpenAiDocumentSource {
+  const bytes = Buffer.from(args.bytes);
+  const maxBytes = 15 * 1024 * 1024;
+  if (bytes.length > maxBytes) {
+    throw new Error(
+      `Document '${args.file_name}' is ${bytes.length} bytes, above inline analysis limit (${maxBytes} bytes).`
+    );
+  }
+
+  return {
+    type: "file_bytes",
+    source_label: args.source_label,
+    file_name: args.file_name,
+    mime_type: args.mime_type || "application/octet-stream",
+    base64: bytes.toString("base64"),
+    size_bytes: bytes.length,
+  };
+}
+
+async function analyzeDocumentWithOpenAi(args: {
+  workspace_id: string;
+  document: SupabaseDocumentRow;
+  source: OpenAiDocumentSource;
+  api_key: string;
+  model: string;
+  max_findings_per_document: number;
+}): Promise<z.infer<typeof openAiDocumentAnalysisSchema>> {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      document_summary: { type: "string" },
+      findings: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            title: { type: "string" },
+            summary: { type: "string" },
+            severity: {
+              type: "string",
+              enum: ["low", "medium", "high", "critical"],
+            },
+            tower: {
+              type: "string",
+              enum: [
+                "financial",
+                "legal_regulatory",
+                "commercial_market",
+                "operations_supply_chain",
+                "people_hr",
+                "tax_jurisdiction",
+                "technical_cyber",
+              ],
+            },
+            probability: { type: "number" },
+            impact_value: { type: "number" },
+            confidence: { type: "number" },
+          },
+          required: [
+            "title",
+            "summary",
+            "severity",
+            "tower",
+            "probability",
+            "impact_value",
+            "confidence",
+          ],
+        },
+      },
+    },
+    required: ["document_summary", "findings"],
+  } as const;
+
+  const systemPrompt = [
+    "You are a senior M&A due-diligence analyst.",
+    "Analyze the provided source document for diligence risks and opportunities.",
+    "Return findings only from evidence in the provided source.",
+    "If there are no material findings, return an empty findings array.",
+  ].join(" ");
+
+  const userText = [
+    `Workspace: ${args.workspace_id}`,
+    `Document ID: ${args.document.document_id}`,
+    `Document Name: ${args.document.document_name}`,
+    `Document Type: ${args.document.document_type}`,
+    `Instruction: Analyze the entire source exactly as supplied.`,
+    `Maximum findings: ${args.max_findings_per_document}`,
+  ].join("\n");
+
+  const userContent: Array<Record<string, unknown>> = [
+    { type: "input_text", text: userText },
+  ];
+  if (args.source.type === "file_bytes") {
+    userContent.push({
+      type: "input_file",
+      filename: args.source.file_name,
+      file_data: `data:${args.source.mime_type};base64,${args.source.base64}`,
+    });
+  } else {
+    userContent.push({
+      type: "input_text",
+      text: args.source.text,
+    });
+  }
+
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${args.api_key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: args.model,
+      temperature: 0.1,
+      input: [
+        {
+          role: "system",
+          content: [{ type: "input_text", text: systemPrompt }],
+        },
+        {
+          role: "user",
+          content: userContent,
+        },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "ma_document_analysis",
+          schema,
+          strict: true,
+        },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(
+      `OpenAI document analysis failed (${res.status}) for '${args.document.document_name}': ${body}`
+    );
+  }
+
+  const responseJson = await res.json();
+  const responseText = extractOpenAiOutputText(responseJson);
+  const parsed = parseJsonPayload(responseText);
+  const validated = openAiDocumentAnalysisSchema.parse(parsed);
+  return {
+    document_summary: validated.document_summary,
+    findings: validated.findings.slice(0, args.max_findings_per_document),
+  };
+}
+
+function extractOpenAiOutputText(payload: unknown): string {
+  const root = toRecord(payload);
+  const outputText = asOptionalString(root.output_text);
+  if (outputText && outputText.trim().length > 0) {
+    return outputText;
+  }
+
+  const output = root.output;
+  if (Array.isArray(output)) {
+    for (const item of output) {
+      const content = toRecord(item).content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        const blockObj = toRecord(block);
+        const text = asOptionalString(blockObj.text);
+        if (text && text.trim().length > 0) {
+          return text;
+        }
+      }
+    }
+  }
+
+  throw new Error(
+    "OpenAI response did not include readable text output for JSON parsing."
+  );
+}
+
+function parseJsonPayload(value: string): unknown {
+  const trimmed = value.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const firstBrace = trimmed.indexOf("{");
+    const lastBrace = trimmed.lastIndexOf("}");
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      const candidate = trimmed.slice(firstBrace, lastBrace + 1);
+      return JSON.parse(candidate);
+    }
+    throw new Error("Could not parse JSON output from OpenAI response.");
+  }
+}
+
+function inferFileName(doc: SupabaseDocumentRow, pathLike: string): string {
+  const fromPath = pathLike.split("/").filter(Boolean).at(-1);
+  if (fromPath && fromPath.trim().length > 0) {
+    return fromPath;
+  }
+  return `${doc.document_name.replace(/\s+/g, "_")}.bin`;
+}
+
+function parseSupabaseUri(
+  sourceUri: string
+): { bucket: string; path: string } | null {
+  const withoutScheme = sourceUri.replace(/^supabase:\/\//, "");
+  const parts = withoutScheme.split("/").filter(Boolean);
+  if (parts.length < 2) {
+    return null;
+  }
+  return {
+    bucket: parts[0]!,
+    path: parts.slice(1).join("/"),
+  };
+}
+
+async function downloadSupabaseStorageObject(
+  bucket: string,
+  path: string
+): Promise<Buffer> {
+  const { base_url, service_role_key } = getSupabaseConfigOrThrow();
+  const encodedPath = path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const url = `${base_url}/storage/v1/object/${encodeURIComponent(bucket)}/${encodedPath}`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      apikey: service_role_key,
+      Authorization: `Bearer ${service_role_key}`,
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(
+      `Failed to download storage object '${bucket}/${path}' (${res.status}): ${body}`
+    );
+  }
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+function getSupabaseConfigOrThrow(): {
+  base_url: string;
+  service_role_key: string;
+  document_table: string;
+} {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error(
+      "Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env/.env.local."
+    );
+  }
+
+  return {
+    base_url: supabaseUrl.replace(/\/+$/, ""),
+    service_role_key: serviceRoleKey,
+    document_table: process.env.SUPABASE_DOCUMENT_TABLE ?? "ma_deal_documents",
+  };
+}
+
+function asRequiredString(value: unknown, field: string): string {
+  if (typeof value === "string" && value.length > 0) {
+    return value;
+  }
+  throw new Error(`Supabase row is missing required field '${field}'.`);
+}
+
+function asOptionalString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function toRecord(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return {};
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
 }
 
 interface ScenarioAssumptions {

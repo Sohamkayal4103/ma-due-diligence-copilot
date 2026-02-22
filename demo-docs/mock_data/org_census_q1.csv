@@ -1,0 +1,7 @@
+Emp_ID,First_Name,Last_Name,Title,Department,Manager_ID,Location,Base_Salary,Stock_Unvested
+1001,Elena,Rostova,CEO,Executive,NULL,New York,450000,500000
+1002,Aris,Thorne,CTO,Engineering,1001,San Francisco,320000,150000
+1003,Marcus,Vance,VP Sales,Sales,1001,Chicago,250000,80000
+1004,Sarah,Jenkins,Lead Architect,Engineering,1002,Remote-US,210000,45000
+1005,David,Chen,Data Scientist,Engineering,1004,Remote-US,185000,20000
+1006,Maria,Gonzalez,General Counsel,Legal,1001,New York,290000,90000

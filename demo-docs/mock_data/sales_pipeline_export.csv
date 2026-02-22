@@ -1,0 +1,6 @@
+Invoice_ID,Contract_Date,Customer_Name,Region,Product_Tier,ARR_USD,Contract_Term_Months,Renewal_Risk
+INV-9901,2023-03-01,Northwind Retail LLC,NAMER,Enterprise,1200000,36,High
+INV-9902,2024-01-15,Oceanic Airlines,APAC,Professional,450000,12,Low
+INV-9903,2024-06-10,Globex Corporation,EMEA,Enterprise,950000,24,Medium
+INV-9904,2022-11-01,Initech,NAMER,Professional,320000,12,Low
+INV-9905,2025-01-20,Umbrella Corp,EMEA,Enterprise,1500000,36,Medium

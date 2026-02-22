@@ -39,11 +39,14 @@ This project models a full deal workflow across financial, legal, commercial, op
 ## MCP Tools
 
 Core diligence tools:
+- `show_landing_home`
 - `create_workspace`
+- `submit_deal_intake`
 - `ingest_evidence_batch`
 - `list_findings`
 - `recompute_risk_graph`
 - `run_scenarios`
+- `analyze_documents_with_openai`
 - `request_missing_evidence`
 - `approve_finding`
 - `generate_ic_package`
@@ -78,13 +81,18 @@ pnpm install
 pnpm dev
 ```
 
+By default, opening `http://localhost:3000` redirects to the landing widget page.
+
 After server starts, open MCP Inspector and run:
-1. `bootstrap_demo_flow`
-2. `list_findings` (set `as_widget: true` to render risk-map)
-3. `approve_finding` for findings in `requires_approval`
-4. `run_scenarios` or `run_finding_scenario_story`
-5. `generate_ic_package`
-6. `list_audit_ledger`
+1. `show_landing_home`
+2. Use landing widget buttons (`Create New Merger` / `Create New Acquisition`) and submit the intake form
+3. `bootstrap_demo_flow`
+4. `list_findings` (set `as_widget: true` to render risk-map)
+5. `approve_finding` for findings in `requires_approval`
+6. `run_scenarios` or `run_finding_scenario_story`
+7. `analyze_documents_with_openai` (renders AI findings widget with finding IDs + document names)
+8. `generate_ic_package`
+9. `list_audit_ledger`
 
 ## Demo Actors
 
@@ -96,8 +104,9 @@ Defined in `src/orchestrator.ts`:
 
 - Current storage is in-memory (process-local)
 - Current risk extraction is rule-based (keywords + claim contradiction rules)
-- No external LLM API is used in this prototype for document analysis
-- Replace with persistent stores (Postgres/graph/event bus) and external connectors for production
+- Optional OpenAI document analysis is available via `analyze_documents_with_openai` (requires `OPENAI_API_KEY`)
+- Supabase persistence is available via `submit_deal_intake` when configured
+- See `SUPABASE_SETUP.md` for table schema and portal setup steps
 
 ## Suggested GitHub Repo Description
 
