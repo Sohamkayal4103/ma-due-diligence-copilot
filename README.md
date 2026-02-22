@@ -10,7 +10,7 @@ This project turns merger and acquisition diligence from a document-heavy, high-
 
 ## Why This Is A Big Deal
 
-M&A is a high-stakes, multi-billion-dollar process where legal and advisory workstreams can dominate deal cost and timeline. In many markets, lawyer and specialist review time commonly runs in the `$100-$200+ / hour` range (and often much higher for senior counsel).
+__Mergers and Acquisitions__ is a high-stakes, multi-billion-dollar process where legal and advisory workstreams can dominate deal cost and timeline. In many markets, lawyer and specialist review time commonly runs in the `$100-$200+ / hour` range (and often much higher for senior counsel).
 
 This copilot is built to:
 - Replace large portions of repetitive legal/analyst diligence work.
