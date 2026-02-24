@@ -8,8 +8,7 @@ This project turns merger and acquisition diligence from a document-heavy, high-
 [MCP Server Link](https://sweet-sunset-f30mi.run.mcp-use.com/mcp)
 
 ## Demo Video
-
-[![Watch the demo](https://img.youtube.com/vi/m1wQrF-cueQ/hqdefault.jpg)](https://youtu.be/m1wQrF-cueQ)
+[Watch the demo](https://youtu.be/i_Edcn-bJZs?si=d9REwFWg3nuv2mPZ)
 
 
 ## Why This Is A Big Deal
