@@ -11,10 +11,12 @@ import {
 } from "./src/orchestrator.js";
 import type {
   Finding,
+  HybridFinding,
   RiskGraph,
   ScenarioDefinition,
   ScenarioResult,
 } from "./src/types.js";
+import { HybridPipelineService } from "./src/services/hybrid-pipeline-service.js";
 
 const server = new MCPServer({
   name: "ma-due-diligence-orchestrator",
@@ -26,6 +28,7 @@ const server = new MCPServer({
 const LANDING_WIDGET_PATH = "/mcp-use/widgets/landing-home/index.html";
 
 const orchestrator = new DueDiligenceOrchestrator();
+const hybridPipeline = new HybridPipelineService();
 const demoWorkspace = orchestrator.seedDemoWorkspace();
 
 type AiFindingStatus = "requires_approval" | "approved" | "rejected";
@@ -45,6 +48,9 @@ interface StoredAiFinding {
   impact_value: number;
   status: AiFindingStatus;
   created_at: string;
+  phase_source: string;
+  quote_verified: boolean;
+  evidence_quotes: string[];
 }
 
 const aiFindingsByWorkspace = new Map<string, Map<string, StoredAiFinding>>();
@@ -754,17 +760,16 @@ server.tool(
   {
     name: "analyze_documents_with_openai",
     description:
-      "Analyze full workspace documents using OpenAI and return AI findings with finding IDs and source document names.",
+      "Run the hybrid tiered analysis pipeline on workspace documents. Phase 1: GPT-4.1-mini sweep + heuristics. Phase 1.5: chunk and embed for RAG. Phase 2: GPT-4.1 deep dive on escalated docs. Phase 3: cross-document synthesis. Includes 5-layer anti-hallucination with quote verification.",
     schema: z.object({
       workspace_id: z.string(),
       as_widget: z.boolean().default(true),
-      model: z.string().default("gpt-4.1"),
       max_findings_per_document: z.number().int().min(1).max(12).default(5),
       actor: actorSchema.optional(),
     }),
     widget: {
       name: "ai-findings",
-      invoking: "Running OpenAI document analysis...",
+      invoking: "Running hybrid tiered analysis pipeline...",
       invoked: "AI findings ready",
     },
     annotations: { readOnlyHint: true },
@@ -772,13 +777,11 @@ server.tool(
   async ({
     workspace_id,
     as_widget,
-    model,
     max_findings_per_document,
     actor,
   }) => {
     const resolvedActor = actor ?? DEMO_ACTOR;
 
-    // Access check against workspace RBAC before contacting external APIs.
     orchestrator.listFindings({
       workspace_id,
       filters: {},
@@ -799,42 +802,107 @@ server.tool(
       );
     }
 
+    const pipelineDocuments = await Promise.all(
+      documents.map(async (doc) => {
+        const source = await resolveDocumentContentForOpenAi(doc);
+        return {
+          document_id: doc.document_id,
+          document_name: doc.document_name,
+          document_type: doc.document_type,
+          tower: undefined as
+            | "financial"
+            | "legal_regulatory"
+            | "commercial_market"
+            | "operations_supply_chain"
+            | "people_hr"
+            | "tax_jurisdiction"
+            | "technical_cyber"
+            | undefined,
+          source: source.type === "file_bytes"
+            ? {
+                type: "file_bytes" as const,
+                file_name: source.file_name,
+                mime_type: source.mime_type,
+                base64: source.base64,
+                size_bytes: source.size_bytes,
+              }
+            : { type: "raw_text" as const, text: source.text },
+          _resolvedSource: source,
+        };
+      })
+    );
+
+    const pipelineResult = await hybridPipeline.runFullPipeline({
+      workspace_id,
+      documents: pipelineDocuments.map(({ _resolvedSource, ...d }) => d),
+      api_key: openaiApiKey,
+      max_findings_per_document,
+      deriveDeterministicFindings: (pipeDoc) => {
+        const original = documents.find(
+          (d) => d.document_id === pipeDoc.document_id
+        )!;
+        const resolved = pipelineDocuments.find(
+          (d) => d.document_id === pipeDoc.document_id
+        )!._resolvedSource;
+        return deriveDeterministicFindingsFromDocument({
+          document: original,
+          source: resolved,
+        });
+      },
+    });
+
     const findings: OpenAiWidgetFinding[] = [];
     const storedFindings: StoredAiFinding[] = [];
     const analyzedDocuments: OpenAiWidgetDocument[] = [];
-    for (const doc of documents) {
-      const source = await resolveDocumentContentForOpenAi(doc);
-      const aiResult = await analyzeDocumentWithOpenAi({
-        workspace_id,
-        document: doc,
-        source,
-        api_key: openaiApiKey,
-        model,
-        max_findings_per_document,
-      });
 
-      const mergedFindings = dedupeAndLimitFindingCandidates(
-        [
-          ...aiResult.findings,
-          ...deriveDeterministicFindingsFromDocument({
-            document: doc,
-            source,
-          }),
-        ],
-        Math.max(max_findings_per_document, 3) + 3
+    for (const p1 of pipelineResult.phase1_results) {
+      const resolvedDoc = pipelineDocuments.find(
+        (d) => d.document_id === p1.document_id
       );
-
+      const resolvedSource = resolvedDoc?._resolvedSource;
       analyzedDocuments.push({
-        document_id: doc.document_id,
-        document_name: doc.document_name,
-        source_type: source.type,
-        source_label: source.source_label,
-        bytes_sent: source.type === "file_bytes" ? source.size_bytes : undefined,
-        chars_sent: source.type === "raw_text" ? source.text.length : undefined,
-        summary: aiResult.document_summary,
+        document_id: p1.document_id,
+        document_name: p1.document_name,
+        source_type: resolvedSource?.type === "file_bytes" ? "file_bytes" : "raw_text",
+        source_label: resolvedSource?.source_label ?? "raw_text",
+        bytes_sent:
+          resolvedSource?.type === "file_bytes"
+            ? resolvedSource.size_bytes
+            : undefined,
+        chars_sent:
+          resolvedSource?.type === "raw_text"
+            ? resolvedSource.text.length
+            : undefined,
+        summary: p1.summary,
       });
+    }
 
-      for (const item of mergedFindings) {
+    const allDocFindings = new Map<string, HybridFinding[]>();
+    for (const f of pipelineResult.all_findings) {
+      // Map phase3 findings to the first document for display
+      const docId =
+        pipelineResult.phase1_results.find((r) =>
+          r.findings.some(
+            (rf) =>
+              rf.title.toLowerCase().trim() === f.title.toLowerCase().trim()
+          )
+        )?.document_id ??
+        pipelineResult.phase2_results.find((r) =>
+          r.findings.some(
+            (rf) =>
+              rf.title.toLowerCase().trim() === f.title.toLowerCase().trim()
+          )
+        )?.document_id ??
+        documents[0]?.document_id ??
+        "unknown";
+
+      if (!allDocFindings.has(docId)) allDocFindings.set(docId, []);
+      allDocFindings.get(docId)!.push(f);
+    }
+
+    for (const [docId, docFindings] of allDocFindings) {
+      const doc = documents.find((d) => d.document_id === docId);
+      for (const item of docFindings) {
         const findingId = randomUUID();
         const managementPoints = item.management_points
           .map((point) => point.trim())
@@ -842,8 +910,8 @@ server.tool(
           .slice(0, 5);
         findings.push({
           finding_id: findingId,
-          document_id: doc.document_id,
-          document_name: doc.document_name,
+          document_id: docId,
+          document_name: doc?.document_name ?? "unknown",
           title: item.title,
           summary: item.summary,
           management_points: managementPoints,
@@ -857,8 +925,8 @@ server.tool(
         storedFindings.push({
           finding_id: findingId,
           workspace_id,
-          document_id: doc.document_id,
-          document_name: doc.document_name,
+          document_id: docId,
+          document_name: doc?.document_name ?? "unknown",
           title: item.title,
           summary: item.summary,
           management_points: managementPoints,
@@ -869,11 +937,20 @@ server.tool(
           impact_value: Math.max(0, Math.round(item.impact_value)),
           status: "requires_approval",
           created_at: new Date().toISOString(),
+          phase_source: item.phase_source,
+          quote_verified: item.quote_verified,
+          evidence_quotes: item.evidence_quotes,
         });
       }
     }
 
     upsertWorkspaceAiFindings(workspace_id, storedFindings);
+
+    const model = `hybrid: ${
+      pipelineResult.phase2_results.length > 0
+        ? "gpt-4.1-mini → gpt-4.1"
+        : "gpt-4.1-mini"
+    }`;
 
     const payload = {
       workspace_id,
@@ -886,11 +963,121 @@ server.tool(
     if (as_widget) {
       return widget({
         props: payload,
-        message: `Analyzed ${analyzedDocuments.length} document(s) and generated ${findings.length} finding(s).`,
+        message: [
+          `Hybrid pipeline complete.`,
+          `Phase 1: ${pipelineResult.phase1_results.length} doc(s) swept with GPT-4.1-mini.`,
+          `Phase 1.5: ${pipelineResult.pipeline_status.chunks_indexed} chunks indexed for RAG.`,
+          `Phase 2: ${pipelineResult.phase2_results.length} escalated doc(s) deep-dived with GPT-4.1.`,
+          `Phase 3: Cross-document synthesis${pipelineResult.phase3_result.coverage_gaps.length > 0 ? ` found ${pipelineResult.phase3_result.coverage_gaps.length} coverage gap(s)` : ""}.`,
+          `Total findings: ${findings.length}.`,
+          `Duration: ${pipelineResult.pipeline_status.pipeline_duration_ms}ms.`,
+        ].join(" "),
       });
     }
 
-    return object(payload);
+    return object({
+      ...payload,
+      pipeline_status: pipelineResult.pipeline_status,
+      phase3_synthesis: {
+        summary: pipelineResult.phase3_result.synthesis_summary,
+        coverage_gaps: pipelineResult.phase3_result.coverage_gaps,
+        cross_doc_findings: pipelineResult.phase3_result.cross_document_findings.length,
+      },
+    });
+  }
+);
+
+server.tool(
+  {
+    name: "query_documents",
+    description:
+      "Ask natural language questions about analyzed documents using multi-path RAG retrieval (semantic + keyword search). Documents must be analyzed first via analyze_documents_with_openai.",
+    schema: z.object({
+      workspace_id: z.string(),
+      query: z.string().min(5),
+      model: z.string().default("gpt-4.1"),
+      top_k: z.number().int().min(1).max(20).default(8),
+      actor: actorSchema.optional(),
+    }),
+    annotations: { readOnlyHint: true },
+  },
+  async ({ workspace_id, query, model, top_k, actor }) => {
+    const resolvedActor = actor ?? DEMO_ACTOR;
+    orchestrator.listFindings({
+      workspace_id,
+      filters: {},
+      actor: resolvedActor,
+    });
+
+    const openaiApiKey = process.env.OPENAI_API_KEY;
+    if (!openaiApiKey || openaiApiKey.trim().length === 0) {
+      throw new Error(
+        "OPENAI_API_KEY is not configured. Add it to .env/.env.local and restart."
+      );
+    }
+
+    const chunkCount = hybridPipeline
+      .getChunkingService()
+      .getChunkCount(workspace_id);
+    if (chunkCount === 0) {
+      throw new Error(
+        `No document chunks indexed for workspace '${workspace_id}'. Run analyze_documents_with_openai first to build the search index.`
+      );
+    }
+
+    const result = await hybridPipeline.queryDocuments({
+      workspace_id,
+      query,
+      api_key: openaiApiKey,
+      model,
+      top_k,
+    });
+
+    return object({
+      workspace_id,
+      query,
+      answer: result.answer,
+      confidence: result.confidence,
+      source_chunks: result.source_chunks,
+      chunks_searched: chunkCount,
+    });
+  }
+);
+
+server.tool(
+  {
+    name: "get_pipeline_status",
+    description:
+      "Get the status of the hybrid analysis pipeline for a workspace, including phase completion, chunk counts, and timing.",
+    schema: z.object({
+      workspace_id: z.string(),
+      actor: actorSchema.optional(),
+    }),
+    annotations: { readOnlyHint: true },
+  },
+  async ({ workspace_id, actor }) => {
+    const resolvedActor = actor ?? DEMO_ACTOR;
+    orchestrator.listFindings({
+      workspace_id,
+      filters: {},
+      actor: resolvedActor,
+    });
+
+    const status = hybridPipeline.getPipelineStatus(workspace_id);
+    if (!status) {
+      return object({
+        workspace_id,
+        status: "not_started",
+        message:
+          "No pipeline has been run for this workspace. Use analyze_documents_with_openai to start.",
+      });
+    }
+
+    return object({
+      workspace_id,
+      status: status.phase3_completed ? "completed" : "in_progress",
+      pipeline: status,
+    });
   }
 );
 

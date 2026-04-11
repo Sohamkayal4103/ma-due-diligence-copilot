@@ -226,3 +226,104 @@ export interface WorkspaceCreateInput {
   materiality_threshold?: number;
   enabled_towers?: DiligenceTower[];
 }
+
+/* ------------------------------------------------------------------ */
+/*  Hybrid Tiered Pipeline Types                                       */
+/* ------------------------------------------------------------------ */
+
+export type PipelinePhase =
+  | "phase1_sweep"
+  | "phase1_5_index"
+  | "phase2_deep"
+  | "phase3_synthesis"
+  | "heuristic";
+
+/** A single chunk of a document stored in the in-memory vector index. */
+export interface DocumentChunk {
+  chunk_id: string;
+  document_id: string;
+  workspace_id: string;
+  text: string;
+  start_offset: number;
+  end_offset: number;
+  token_estimate: number;
+  embedding: number[];
+  metadata: {
+    document_name: string;
+    tower?: DiligenceTower;
+    page_hint?: number;
+  };
+}
+
+/** A finding produced by any phase of the hybrid pipeline. */
+export interface HybridFinding {
+  title: string;
+  summary: string;
+  management_points: string[];
+  severity: RiskSeverity;
+  tower: DiligenceTower;
+  probability: number;
+  impact_value: number;
+  confidence: number;
+  evidence_quotes: string[];
+  phase_source: PipelinePhase;
+  quote_verified: boolean;
+  confidence_penalty: number;
+}
+
+export interface Phase1Result {
+  document_id: string;
+  document_name: string;
+  model_used: string;
+  summary: string;
+  findings: HybridFinding[];
+  escalated: boolean;
+  token_estimate: number;
+}
+
+export interface Phase2Result {
+  document_id: string;
+  document_name: string;
+  model_used: string;
+  summary: string;
+  findings: HybridFinding[];
+  cross_doc_context_used: boolean;
+}
+
+export interface Phase3Result {
+  synthesis_summary: string;
+  cross_document_findings: HybridFinding[];
+  coverage_gaps: string[];
+}
+
+export interface PipelineStatus {
+  workspace_id: string;
+  phase1_completed: number;
+  phase1_total: number;
+  phase2_completed: number;
+  phase2_total: number;
+  phase3_completed: boolean;
+  chunks_indexed: number;
+  total_findings: number;
+  escalated_documents: number;
+  pipeline_duration_ms: number;
+}
+
+export interface QuoteVerificationResult {
+  quote: string;
+  verified: boolean;
+  best_match_score: number;
+  matched_span: string;
+}
+
+export interface RAGQueryResult {
+  answer: string;
+  source_chunks: Array<{
+    chunk_id: string;
+    document_id: string;
+    document_name: string;
+    text: string;
+    relevance_score: number;
+  }>;
+  confidence: number;
+}
