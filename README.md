@@ -320,6 +320,3 @@ Open:
 - See `SUPABASE_SETUP.md` for table and storage setup
 - For production: vector index would move to pgvector on Supabase; in-memory Maps would become database-backed with proper indexes
 
-## Suggested GitHub Repo Description
-
-`AI-native M&A due-diligence copilot: hybrid tiered analysis pipeline (GPT-4.1-mini sweep → GPT-4.1 deep dive → cross-document synthesis), multi-path RAG Q&A, 5-layer anti-hallucination with quote verification, federated evidence ingestion, contradiction intelligence, approval governance, scenario simulation, and executive-ready IC reporting.`
